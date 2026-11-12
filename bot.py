@@ -1,6 +1,5 @@
 import os
 import threading
-import asyncio
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -20,11 +19,8 @@ def run_web():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("البوت شغال ✅")
 
-async def main():
-    application = ApplicationBuilder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    await application.run_polling()
-
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    asyncio.run(main())
+    application = ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.run_polling()
