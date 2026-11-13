@@ -1,9 +1,22 @@
-import os, yfinance as yf, datetime
+import os, yfinance as yf, datetime, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-MAX_CONTRACT_PRICE = 2.10  # = 210$ للعقد الواحد
+
+# سيرفر وهمي عشان Render ما يطفي البوت
+def keep_alive():
+    port = int(os.environ.get("PORT", 10000))
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        def log_message(self, *a): pass
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
+MAX_CONTRACT_PRICE = 2.10
 MAX_CONTRACTS = 1
 
 def get_expiry():
@@ -33,24 +46,18 @@ def analyze(ticker):
     daily = tk.history(period="5d", interval="1d")
     if hist.empty or daily.empty: return None
     price = float(hist['Close'].iloc[-1])
-    # RSI 5د - مبسط
     delta = hist['Close'].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean().iloc[-1]
     loss = -delta.where(delta < 0, 0).rolling(14).mean().iloc[-1]
     rsi = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
-    # VWAP - مصلح
     vwap = float((hist['Close'] * hist['Volume']).sum() / hist['Volume'].sum()) if hist['Volume'].sum() else price
-    # زخم
     mom15 = (hist['Close'].iloc[-1] / hist['Close'].iloc[-4] - 1) * 100 if len(hist) > 4 else 0
     mom1h = (hist['Close'].iloc[-1] / hist['Close'].iloc[-5] - 1) * 100 if len(hist) > 5 else 0
     trend3 = (daily['Close'].iloc[-1] / daily['Close'].iloc[-4] - 1) * 100 if len(daily) >= 4 else 0
-    # سيولة
     vol = float(hist['Volume'].iloc[-1]); vol_avg = float(hist['Volume'].mean())
     liq = vol / vol_avg if vol_avg else 0
-    # دعم ومقاومة قريب وبعيد
     sup_n = float(daily['Low'].tail(2).min()); res_n = float(daily['High'].tail(2).max())
     sup_f = float(daily['Low'].min()); res_f = float(daily['High'].max())
-    # عقد - سترايك وسعر و Greeks
     expiry_str = get_expiry().strftime("%Y-%m-%d")
     contract_price, strike, iv, delta_g, theta = 1.85, round(price + 2.5), 38, 0.42, -0.18
     is_call_guess = mom15 >= 0
