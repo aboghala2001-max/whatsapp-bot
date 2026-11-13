@@ -1,4 +1,4 @@
-import os, threading, logging
+import os, threading, logging, time
 import yfinance as yf
 import pandas as pd
 from flask import Flask
@@ -66,12 +66,17 @@ def run_bot():
     if not TOKEN:
         print("ERROR: BOT_TOKEN is missing")
         return
-    print("Bot starting polling...")
-    app_ = ApplicationBuilder().token(TOKEN).build()
-    app_.add_handler(CommandHandler("start", start))
-    app_.add_handler(CommandHandler("s", stock))
-    app_.add_handler(CommandHandler("watch", watch))
-    app_.run_polling(drop_pending_updates=True)
+    while True:
+        try:
+            print("Bot starting polling...")
+            app_ = ApplicationBuilder().token(TOKEN).build()
+            app_.add_handler(CommandHandler("start", start))
+            app_.add_handler(CommandHandler("s", stock))
+            app_.add_handler(CommandHandler("watch", watch))
+            app_.run_polling(drop_pending_updates=True, stop_signals=None)
+        except Exception as e:
+            print(f"Bot crashed, retry in 5 sec: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
