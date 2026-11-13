@@ -14,9 +14,7 @@ threading.Thread(target=run_web, daemon=True).start()
 TOKEN = os.environ.get("BOT_TOKEN")
 
 def clean_symbol(s):
-    # ينظف أي سلاش او مسافة او حروف غريبة
-    s = re.sub(r'[^A-Za-z]', '', s.upper().strip())
-    return s
+    return re.sub(r'[^A-Za-z]', '', s.upper().strip())
 
 def calc_rsi(closes, period=14):
     if len(closes) < period+1: return 50
@@ -35,22 +33,20 @@ def get_data_stooq(symbol):
     if "Date" not in r.text: return None
     reader=csv.DictReader(io.StringIO(r.text))
     rows=[x for x in reader if x['Close']!='N/D']
-    if len(rows)<10: return None
+    if len(rows)<20: return None
     return rows
 
 def get_data_yahoo(symbol):
     url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=3mo&interval=1d"
-    r=requests.get(url, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=15)
+    r=requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
     j=r.json()
     res=j['chart']['result'][0]
-    closes=res['indicators']['quote'][0]['close']
-    highs=res['indicators']['quote'][0]['high']
-    lows=res['indicators']['quote'][0]['low']
+    q=res['indicators']['quote'][0]
     rows=[]
-    for c,h,l in zip(closes,highs,lows):
+    for c,h,l,v in zip(q['close'], q['high'], q['low'], q['volume']):
         if c is None: continue
-        rows.append({'Close':str(c),'High':str(h),'Low':str(l)})
-    if len(rows)<10: return None
+        rows.append({'Close':str(c),'High':str(h),'Low':str(l),'Volume':str(v or 0)})
+    if len(rows)<20: return None
     return rows
 
 def get_analysis(raw):
@@ -58,36 +54,99 @@ def get_analysis(raw):
         symbol=clean_symbol(raw)
         if not symbol: return "اكتب السهم كذا: /s NVDA"
         rows=None
-        # جرب Stooq اول، اذا فشل جرب Yahoo
         try: rows=get_data_stooq(symbol)
         except: rows=None
         if not rows:
             try: rows=get_data_yahoo(symbol)
             except: rows=None
         if not rows:
-            return f"ما لقيت السهم {symbol} ❌\nجرب: /s AAPL\nتأكد انه سهم أمريكي"
+            return f"ما لقيت السهم {symbol} ❌\nجرب: /s AAPL"
 
         closes=[float(x['Close']) for x in rows]
         highs=[float(x['High']) for x in rows]
         lows=[float(x['Low']) for x in rows]
+        vols=[float(x.get('Volume',0) or 0) for x in rows]
+
         price=closes[-1]; prev=closes[-2]
         change=price-prev; change_pct=(change/prev)*100
-        sma20=sum(closes[-20:])/min(20,len(closes))
-        sma50=sum(closes[-50:])/min(50,len(closes)) if len(closes)>=50 else sum(closes)/len(closes)
+        sma20=sum(closes[-20:])/20
+        sma50=sum(closes[-50:])/50 if len(closes)>=50 else sum(closes)/len(closes)
         rsi=calc_rsi(closes)
         support=min(lows[-20:]); resistance=max(highs[-20:])
         change_5d=((closes[-1]-closes[-6])/closes[-6])*100 if len(closes)>=6 else 0
         change_1m=((closes[-1]-closes[-22])/closes[-22])*100 if len(closes)>=22 else 0
 
-        if price>sma20 and price>sma50 and rsi>=50:
-            trend="صاعد 📈"; decision="الاتجاه العام صاعد، الشراء مع أي نزول للدعم أفضل"
-        elif price<sma20 and price<sma50 and rsi<50:
-            trend="هابط 📉"; decision="الاتجاه العام هابط، لا تشتري الا اذا اخترق المقاومة"
+        # --- السيولة ---
+        avg_vol=sum(vols[-20:-1])/19 if len(vols)>=20 else sum(vols)/len(vols)
+        today_vol=vols[-1]
+        vol_ratio=(today_vol/avg_vol*100) if avg_vol>0 else 100
+
+        if change_pct>0 and today_vol>avg_vol:
+            liq="🟢 السيولة داخلة شراء - قوة شرائية"
+            liq_dir="شراء"
+        elif change_pct<0 and today_vol>avg_vol:
+            liq="🔴 السيولة خارجة بيع - ضغط بيع"
+            liq_dir="بيع"
+        elif today_vol<avg_vol*0.7:
+            liq="⚪ سيولة ضعيفة - السوق متردد"
+            liq_dir="متردد"
         else:
-            trend="متذبذب ↔️"; decision="السهم متذبذب بين الدعم والمقاومة، انتظر اختراق"
+            liq="🟡 سيولة طبيعية"
+            liq_dir="طبيعي"
+
+        # --- CALL / PUT ---
+        dist_support=((price-support)/price)*100
+        dist_resist=((resistance-price)/price)*100
+
+        if price>sma20 and price>sma50 and rsi>=50 and rsi<70 and change_pct>0:
+            option="🟢 اشتري CALL"
+            option_reason="السعر فوق المتوسطات + RSI ايجابي + سيولة شراء"
+            entry=f"الدخول: فوق {price:.2f}$"
+            target=f"الهدف: {resistance:.2f}$"
+            stop=f"وقف: {sma20:.2f}$"
+            duration="1 - 3 أيام - فرصة سريعة"
+            if vol_ratio>150: duration="1 - 2 يوم - زخم قوي جدا، لا تطول"
+            elif rsi>60: duration="2 - 5 أيام"
+            else: duration="5 - 10 أيام - فرصة سوينق"
+        elif price<sma20 and price<sma50 and rsi<50 and change_pct<0:
+            option="🔴 اشتري PUT"
+            option_reason="السعر تحت المتوسطات + RSI سلبي + سيولة بيع"
+            entry=f"الدخول: تحت {price:.2f}$"
+            target=f"الهدف: {support:.2f}$"
+            stop=f"وقف: {sma20:.2f}$"
+            duration="1 - 3 أيام - فرصة سريعة"
+            if vol_ratio>150: duration="1 - 2 يوم - زخم قوي جدا، لا تطول"
+            elif rsi<40: duration="2 - 5 أيام"
+            else: duration="5 - 10 أيام - فرصة سوينق"
+        elif rsi<=30 and dist_support<3:
+            option="🟢 CALL انعكاس - بحذر"
+            option_reason=f"RSI {rsi:.0f} تشبع بيع + السعر قريب من الدعم {support:.2f}$"
+            entry=f"الدخول: من الدعم {support:.2f}$"
+            target=f"الهدف: {sma20:.2f}$"
+            stop=f"وقف: كسر {support:.2f}$"
+            duration="1 - 3 أيام - مضاربة سريعة فقط"
+        elif rsi>=70 and dist_resist<3:
+            option="🔴 PUT انعكاس - بحذر"
+            option_reason=f"RSI {rsi:.0f} تشبع شراء + السعر قريب من المقاومة {resistance:.2f}$"
+            entry=f"الدخول: من المقاومة {resistance:.2f}$"
+            target=f"الهدف: {sma20:.2f}$"
+            stop=f"وقف: اختراق {resistance:.2f}$"
+            duration="1 - 3 أيام - مضاربة سريعة فقط"
+        else:
+            option="⏸️ لا تدخل الحين"
+            option_reason="لا يوجد اتجاه واضح، انتظر اختراق او كسر"
+            entry=f"انتظر اختراق {resistance:.2f}$ للـ CALL او كسر {support:.2f}$ للـ PUT"
+            target="-"
+            stop="-"
+            duration="لا توجد فرصة واضحة"
+
         if rsi>=70: rsi_txt=f"{rsi:.0f} - تشبع شراء ⚠️"
         elif rsi<=30: rsi_txt=f"{rsi:.0f} - تشبع بيع 🟢"
         else: rsi_txt=f"{rsi:.0f} - طبيعي"
+
+        if price>sma20 and price>sma50: trend="صاعد 📈"
+        elif price<sma20 and price<sma50: trend="هابط 📉"
+        else: trend="متذبذب ↔️"
 
         return f"""📊 تحليل {symbol}
 
@@ -97,15 +156,23 @@ def get_analysis(raw):
 📅 شهر: {change_1m:+.2f}%
 
 🔍 الاتجاه: {trend}
-📏 متوسط 20 يوم: {sma20:.2f}$
-📏 متوسط 50 يوم: {sma50:.2f}$
+📏 متوسط 20: {sma20:.2f}$ | 50: {sma50:.2f}$
 📊 RSI: {rsi_txt}
 
-🟢 دعم: {support:.2f}$
-🔴 مقاومة: {resistance:.2f}$
+🟢 دعم: {support:.2f}$ ({dist_support:.1f}%)
+🔴 مقاومة: {resistance:.2f}$ ({dist_resist:.1f}%)
 
-💡 الخلاصة:
-{decision}
+💧 السيولة:
+{liq}
+📊 حجم اليوم vs المتوسط: {vol_ratio:.0f}%
+
+🎯 قرار الأوبشن:
+{option}
+💡 السبب: {option_reason}
+📍 {entry}
+🎯 {target}
+🛑 {stop}
+⏳ مدة الفرصة: {duration}
 """
     except Exception as e:
         return f"صار خطأ، جرب مرة ثانية: /s {raw}"
