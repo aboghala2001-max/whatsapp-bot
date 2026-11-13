@@ -14,6 +14,21 @@ def home(): return "Bot is running"
 
 DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
 
+# ===== اعدادات العقود - منصة سهم =====
+# انت قلت 2-3 عقود، ومو قريبة مرة - نحسب على 2 عشان نكون محافظين
+CONTRACTS = 2
+COMMISSION_PER_CONTRACT = 0.99
+COMMISSION_MIN = 1.99
+VAT = 0.15
+# تكلفة الذهاب والعودة لـ 2 عقود = 4.58$
+COST_TOTAL = (max(COMMISSION_MIN, COMMISSION_PER_CONTRACT * CONTRACTS) * 2) * (1 + VAT)
+TARGET_NET_PROFIT = 5.0 * CONTRACTS  # نبي صافي 5$ لكل عقد = 10$ لـ 2 عقود
+MIN_PROFIT_TOTAL = COST_TOTAL + TARGET_NET_PROFIT  # 14.58$
+MIN_PREMIUM_MOVE = MIN_PROFIT_TOTAL / (CONTRACTS * 100)  # 0.07$ في سعر العقد
+DELTA = 0.35  # محافظ للقريب والبعيد شوي - ATM=0.50 و OTM=0.30 فـ 0.35 يمشي للاثنين
+MIN_STOCK_MOVE = MIN_PREMIUM_MOVE / DELTA  # = 0.20$ في السهم - هذا هو شرط النجاح الجديد
+REVERSAL_PCT = 0.004  # 0.4% انعكاس
+
 # ===== حفظ دائم =====
 def load_json(name, default):
     try:
@@ -107,10 +122,9 @@ def analyze(ticker):
         return f"📊 *{ticker.upper()}*\n💰 السعر: ${sig['price']:.2f} ({sig['change']:+.2f}%)\n🎯 {sig['option']} - {sig['strength']}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
     return f"🚨 *فرصة {sig['strength']}*\n📊 *{ticker.upper()}*\n🎯 {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f}\n🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
 
-# ===== التقييم - أهم دالة =====
+# ===== التقييم - نسخة العقود =====
 async def check_and_send(bot):
     global ACTIVE_SIGNALS, HISTORY
-    # نقرأ الملف من جديد كل مرة عشان ما نعتمد على الذاكرة
     ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
     HISTORY = load_json("history.json", [])
     for key in list(ACTIVE_SIGNALS.keys()):
@@ -125,27 +139,58 @@ async def check_and_send(bot):
             sig_now = get_signal(sym)
             if not sig_now: continue
             cur = sig_now['price']
+
+        entry = old['entry']
+        move = cur - entry  # موجب = صعود، سالب = نزول
+        is_call = "CALL" in old['option']
+
+        # --- 1. تنبيه الانعكاس - قبل ما تخلص الفرصة ---
+        if not old.get('reversed_alerted'):
+            reversed_now = False
+            if is_call and move <= -entry * REVERSAL_PCT:
+                reversed_now = True
+                txt_rev = f"⚠️ انعكاس - عقد {sym} CALL قلب عليك\nدخول: ${entry:.2f} | الحالي: ${cur:.2f} ({move:+.2f}$)\nالعقد قاعد يذوب، فكر تطلع الحين قبل الستوب"
+            elif not is_call and move >= entry * REVERSAL_PCT:
+                reversed_now = True
+                txt_rev = f"⚠️ انعكاس - عقد {sym} PUT قلب عليك\nدخول: ${entry:.2f} | الحالي: ${cur:.2f} ({move:+.2f}$)\nالعقد قاعد يذوب، فكر تطلع الحين قبل الستوب"
+            if reversed_now:
+                old['reversed_alerted'] = True
+                ACTIVE_SIGNALS[key] = old
+                save_json("active.json", ACTIVE_SIGNALS)
+                try: await bot.send_message(chat_id=chat_id, text=txt_rev)
+                except Exception as e: print(f"Reversal send error: {e}")
+
+        # --- 2. تقييم النهاية - للعقود ---
         result = None; reason_txt = ""
-        if "CALL" in old['option']:
+        # الهدف والستوب الاصليين - بس لازم يغطي عمولة العقود
+        if is_call:
             if cur >= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
             elif cur <= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
-        else: # PUT
+        else:
             if cur <= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
             elif cur >= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
+
         if result is None and (time.time() - old.get('time', time.time()) > 1800):
             result = "timeout"
+
         if result:
             if result == "timeout":
-                if "CALL" in old['option']:
-                    result = "win" if cur > old['entry'] else "loss"
+                # شرط العقود الجديد: لازم يتحرك 0.20$ على الاقل في اتجاهك
+                if is_call:
+                    if move >= MIN_STOCK_MOVE:
+                        result = "win"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
+                    else:
+                        result = "loss"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
                 else:
-                    result = "win" if cur < old['entry'] else "loss"
-                reason_txt = "⏳ خلص وقتها (30 دقيقة)"
-            HISTORY.append({"symbol": sym, "result": result, "option": old['option'], "entry": old['entry'], "exit": cur, "time": old.get('time', time.time())})
+                    if move <= -MIN_STOCK_MOVE:
+                        result = "win"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
+                    else:
+                        result = "loss"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
+            HISTORY.append({"symbol": sym, "result": result, "option": old['option'], "entry": entry, "exit": cur, "move": move, "time": old.get('time', time.time())})
             save_json("history.json", HISTORY)
             emoji = "✅ نجحت" if result == "win" else "❌ فشلت"
             try:
-                await bot.send_message(chat_id=chat_id, text=f"{emoji} - فرصة {sym} خلصت\n{reason_txt}\nدخول: ${old['entry']:.2f} | السعر الحالي: ${cur:.2f}\nالحين اقدر ارسل لك فرصة جديدة على {sym} اذا جت 🔥\nشوف تقييمي بـ /stats")
+                await bot.send_message(chat_id=chat_id, text=f"{emoji} - عقد {sym} خلصت\n{reason_txt}\nدخول: ${entry:.2f} | السعر الحالي: ${cur:.2f} | الحركة: {move:+.2f}$\nعمولة سهم لـ {CONTRACTS} عقود: ${COST_TOTAL:.2f}\nالحين اقدر ارسل لك فرصة جديدة على {sym} اذا جت 🔥\nشوف تقييمي بـ /stats")
             except Exception as e: print(f"Send eval error: {e}")
             if key in ACTIVE_SIGNALS:
                 del ACTIVE_SIGNALS[key]
@@ -164,9 +209,9 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
             last_price = ALERTED.get(key, 0)
             if abs(sig['price'] - last_price) < 1: continue
             ALERTED[key] = sig['price']
-            ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time()}
+            ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time(), "reversed_alerted": False}
             save_json("active.json", ACTIVE_SIGNALS)
-            msg = f"🚨 فرصة {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
+            msg = f"🚨 فرصة عقود {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول السهم: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n📊 للعقود ({CONTRACTS} عقود): لازم السهم يتحرك {MIN_STOCK_MOVE:.2f}$ عشان تغطي عمولة سهم + ربح\n⚠️ اذا انعكس عليك 0.4% بجيك تنبيه انعكاس\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
             try: await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception as e: print(e)
 
@@ -187,8 +232,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wins = len([h for h in HISTORY_NOW if h.get('result') == "win"])
     losses = total - wins
     rate = wins / total * 100 if total else 0
-    txt = f"📊 *تقييم البوت لنفسه*\n\n"
-    txt += f"إجمالي الفرص: {total}\n✅ نجحت: {wins}\n❌ فشلت: {losses}\n🎯 نسبة النجاح: {rate:.0f}%\n\n"
+    txt = f"📊 *تقييم البوت لنفسه - عقود*\n\n"
+    txt += f"إجمالي الفرص: {total}\n✅ نجحت: {wins}\n❌ فشلت: {losses}\n🎯 نسبة النجاح: {rate:.0f}%\n"
+    txt += f"عمولة سهم لـ {CONTRACTS} عقود: ${COST_TOTAL:.2f} ذهاب وعودة\nشرط النجاح: حركة {MIN_STOCK_MOVE:.2f}$ على الاقل\n\n"
     for sym in DEFAULT_SYMBOLS:
         sh = [h for h in HISTORY_NOW if h.get('symbol') == sym]
         if sh:
