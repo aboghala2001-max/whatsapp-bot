@@ -1,4 +1,4 @@
-import os, threading, logging
+import os, threading, logging, time
 import yfinance as yf
 import pandas as pd
 from flask import Flask
@@ -11,10 +11,14 @@ app_web = Flask(__name__)
 @app_web.route('/')
 def home(): return "Bot is running"
 
-# القائمة اللي بيراقبها تلقائي
 DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
 WATCHLIST = {}
 ALERTED = {}
+
+# === جديد: منع التكرار + التقييم ===
+ACTIVE_SIGNALS = {}  # { "chatid_SYMBOL": {entry,target,stop,option,time} }
+HISTORY = []  # كل الفرص اللي خلصت
+# HISTORY = [{"symbol": "NVDA", "result": "win"/"loss", "option": "CALL"}]
 
 def rsi_calc(data, period=14):
     delta = data.diff()
@@ -78,6 +82,39 @@ def analyze(ticker):
 async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
     for chat_id, symbols in list(WATCHLIST.items()):
         for sym in symbols:
+            # 1. شيك هل فيه فرصة شغالة لنفس السهم؟ اذا فيه قيمها
+            active_key = f"{chat_id}_{sym}"
+            if active_key in ACTIVE_SIGNALS:
+                old = ACTIVE_SIGNALS[active_key]
+                sig_now = get_signal(sym)
+                if not sig_now: continue
+                cur = sig_now['price']
+                result = None
+                # CALL: وصل الهدف او ضرب الستوب
+                if "CALL" in old['option']:
+                    if cur >= old['target']: result = "win"
+                    elif cur <= old['stop']: result = "loss"
+                else: # PUT
+                    if cur <= old['target']: result = "win"
+                    elif cur >= old['stop']: result = "loss"
+                # لو مر 30 دقيقة (1800 ثانية) بدون نتيجة = انتهت
+                if result is None and (time.time() - old['time'] > 1800):
+                    result = "timeout"
+                if result:
+                    if result in ["win","loss"]:
+                        HISTORY.append({"symbol": sym, "result": result, "option": old['option']})
+                        emoji = "✅ نجحت" if result == "win" else "❌ فشلت"
+                        try:
+                            await context.bot.send_message(chat_id=chat_id, text=f"{emoji} - فرصة {sym} خلصت\nدخول: ${old['entry']:.2f} | السعر الحالي: ${cur:.2f}\nالحين اقدر ارسل لك فرصة جديدة على {sym} اذا جت 🔥")
+                        except: pass
+                    del ACTIVE_SIGNALS[active_key]
+                    # لو فشلت او نجحت كمل ولا ترسل فرصة جديدة بنفس اللفة، انتظر اللفة الجاية
+                    continue
+                else:
+                    # فيه فرصة شغالة للحين، لا تكرر
+                    continue
+
+            # 2. لو مافيه فرصة شغالة، دور على فرصة جديدة
             sig = get_signal(sym)
             if not sig: continue
             if sig['strength'] not in ["قوية جدا 🔥", "قوية 💪"]:
@@ -87,7 +124,9 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
             if abs(sig['price'] - last_price) < 1:
                 continue
             ALERTED[key] = sig['price']
-            msg = f"🚨 فرصة {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}"
+            # سجلها كفرصة شغالة عشان ما تتكرر
+            ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time()}
+            msg = f"🚨 فرصة {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
             try:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             except Exception as e:
@@ -96,7 +135,29 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     WATCHLIST[chat_id] = DEFAULT_SYMBOLS.copy()
-    await update.message.reply_text("هلا فيك 👋\nسجلتك في التنبيه التلقائي ✅\nبيراقب لك:\nAMZN, NVDA, AAPL, TSLA, MSFT, GOOGL, QQQ, SPY, META, XSP\n\nأي فرصة قوية بتجيك لحالها 🔥\nوتقدر تسأل عن أي سهم بـ /s NVDA")
+    await update.message.reply_text("هلا فيك 👋\nسجلتك في التنبيه التلقائي ✅\nبيراقب لك:\nAMZN, NVDA, AAPL, TSLA, MSFT, GOOGL, QQQ, SPY, META, XSP\n\nأي فرصة قوية بتجيك لحالها 🔥\nوتقدر تسأل عن أي سهم بـ /s NVDA\nوتشوف تقييم البوت بـ /stats")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not HISTORY:
+        await update.message.reply_text("📊 للحين مافيه فرص خلصت عشان اقيمها\nانتظر اول فرصة تخلص وبيجيك التقييم هنا")
+        return
+    total = len(HISTORY)
+    wins = len([h for h in HISTORY if h['result'] == "win"])
+    losses = total - wins
+    rate = wins / total * 100 if total else 0
+    # افضل سهم
+    txt = f"📊 *تقييم البوت لنفسه*\n\n"
+    txt += f"إجمالي الفرص: {total}\n✅ نجحت: {wins}\n❌ فشلت: {losses}\n🎯 نسبة النجاح: {rate:.0f}%\n\n"
+    # حسب السهم
+    for sym in DEFAULT_SYMBOLS:
+        sh = [h for h in HISTORY if h['symbol'] == sym]
+        if sh:
+            sw = len([h for h in sh if h['result']=="win"])
+            txt += f"{sym}: {sw}/{len(sh)} نجحت ({sw/len(sh)*100:.0f}%)\n"
+    # الفرص الشغالة الحين
+    if ACTIVE_SIGNALS:
+        txt += f"\n⏳ فرص شغالة الحين: {len(ACTIVE_SIGNALS)}"
+    await update.message.reply_text(txt, parse_mode="Markdown")
 
 async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -120,6 +181,7 @@ def run_bot():
     app_.add_handler(CommandHandler("start", start))
     app_.add_handler(CommandHandler("s", stock))
     app_.add_handler(CommandHandler("watch", watch))
+    app_.add_handler(CommandHandler("stats", stats))
     if app_.job_queue:
         app_.job_queue.run_repeating(auto_alert, interval=300, first=10)
     app_.run_polling(drop_pending_updates=True)
