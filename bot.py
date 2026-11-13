@@ -20,6 +20,7 @@ COMMISSION = 4.58
 SUCCESS_MOVE = 0.20
 REVERSAL_PCT = 0.40
 active_trades = {}
+trade_history = []  # سجل التقييم
 BEST_TICKERS = ["NVDA","TSLA","AAPL","MSFT","AMZN","META","AMD","NFLX","GOOGL","AVGO","PLTR","COIN",
                 "JPM","V","MA","BAC","GS","UNH","JNJ","LLY","ABBV","WMT","COST","HD","PG","DIS",
                 "XOM","CAT","ORCL","CRM","ADBE","SPY","QQQ"]
@@ -31,7 +32,6 @@ def get_expiry():
     return today + datetime.timedelta(days=days_ahead)
 
 def get_market_trend():
-    # اتجاه السوق العام SPY
     try:
         spy = yf.Ticker("SPY").history(period="5d", interval="15m")
         if spy.empty: return 0, 0
@@ -43,19 +43,13 @@ def get_market_trend():
         return 0, 0
 
 def is_bad_time():
-    # وقت السوق بتوقيت نيويورك
     try:
         now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
-        # ويكند
         if now_et.weekday() >= 5: return True, "السوق مسكر - ويكند"
         mins = now_et.hour * 60 + now_et.minute
-        # قبل الافتتاح وبعده
         if mins < 575 or mins >= 960: return True, "السوق مسكر"
-        # أول 5 دقايق 9:30 - 9:35
         if 570 <= mins < 575: return True, "أول 5 دقايق - كذب"
-        # وقت الغداء 12:00 - 13:00
         if 720 <= mins < 780: return True, "وقت غداء - بطيء"
-        # آخر نص ساعة 15:30 - 16:00
         if mins >= 930: return True, "آخر نص ساعة - خطير"
         return False, ""
     except:
@@ -127,9 +121,7 @@ def analyze(ticker):
     score = abs(mom15)*3 + abs(trend3)*2 + min(liq,5)*2
     if cont_type != "none": score += 10
     if 45 <= rsi <= 75: score += 5
-    # بونص اذا مع السوق
     if (mom15 > 0 and spy_mom >= 0) or (mom15 < 0 and spy_mom <= 0): score += 5
-    # بونص اذا مع VWAP
     if (mom15 > 0 and price > vwap) or (mom15 < 0 and price < vwap): score += 5
     return {"price":price,"rsi":rsi,"vwap":vwap,"mom15":mom15,"mom1h":mom1h,"trend":trend3,"liq":liq,
             "sup_n":sup_n,"sup_f":sup_f,"res_n":res_n,"res_f":res_f,
@@ -141,11 +133,8 @@ def format_msg(ticker, d):
     stop = d['cprice'] * 0.70
     t1 = d['cprice'] * 1.50
     t2 = d['cprice'] * 2.0
-    # فلتر الوقت
     bad, bad_reason = is_bad_time()
-    # CALL: مستمرة + فوق VWAP + السوق صاعد
     is_call = d['cont_type'] in ("short","long") and d['mom15'] >= 0 and d['trend'] > 0 and d['liq'] >= 1.2 and d['price'] > d['vwap'] and d['spy_mom'] >= 0 and not bad
-    # PUT: مستمرة + تحت VWAP + السوق هابط
     is_put = d['cont_type'] in ("short","long") and d['mom15'] <= 0 and d['trend'] < 0 and d['liq'] >= 1.2 and d['price'] < d['vwap'] and d['spy_mom'] <= 0 and not bad
     if d['cprice'] > MAX_CONTRACT_PRICE: dec = "تخطي"
     elif is_call: dec = "CALL"
@@ -176,11 +165,15 @@ async def check_targets(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id, f"🎯 {tr['ticker']} وصل الهدف الأول +50% ({cur:.2f}$) - حرك وقفك على الدخول")
             if not tr.get('t2_hit') and cur >= tr['t2']:
                 tr['t2_hit'] = True
-                await context.bot.send_message(chat_id, f"🎯🎯 {tr['ticker']} وصل الهدف الثاني +100% ({cur:.2f}$) - بيع العقد كامل 🎉")
+                profit = (cur - tr['entry']) / tr['entry'] * 100
+                trade_history.append({'ticker': tr['ticker'], 'type': tr['type'], 'result': 'win', 'profit': profit})
+                await context.bot.send_message(chat_id, f"🎯🎯 {tr['ticker']} وصل الهدف الثاني +100% ({cur:.2f}$) - بيع العقد كامل 🎉\n\n📋 تقييم الفرصة:\nالسهم: {tr['ticker']} {tr['type']}\nالدخول: {tr['entry']:.2f}$ - الخروج: {cur:.2f}$\nالنتيجة: ربح +{profit:.0f}% ✅\nالتقييم: فرصة ناجحة")
                 del active_trades[chat_id]
                 continue
             if cur <= tr['stop']:
-                await context.bot.send_message(chat_id, f"🛑 {tr['ticker']} وصل الوقف -30% ({cur:.2f}$) - اطلع فورا")
+                profit = (cur - tr['entry']) / tr['entry'] * 100
+                trade_history.append({'ticker': tr['ticker'], 'type': tr['type'], 'result': 'loss', 'profit': profit})
+                await context.bot.send_message(chat_id, f"🛑 {tr['ticker']} وصل الوقف -30% ({cur:.2f}$) - اطلع فورا\n\n📋 تقييم الفرصة:\nالسهم: {tr['ticker']} {tr['type']}\nالدخول: {tr['entry']:.2f}$ - الخروج: {cur:.2f}$\nالنتيجة: خسارة {profit:.0f}% ❌\nالتقييم: فرصة فاشلة")
                 del active_trades[chat_id]
         except: pass
 
@@ -224,6 +217,32 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out += f"#{i} {m}\n\n"
     await update.message.reply_text(out.strip())
 
+async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not trade_history:
+        await update.message.reply_text("لسه ما انتهت أي فرصة، جرب الاثنين وشوف النتايج هنا")
+        return
+    wins = [x for x in trade_history if x['result'] == 'win']
+    losses = [x for x in trade_history if x['result'] == 'loss']
+    total = len(trade_history)
+    win_rate = len(wins) / total * 100 if total else 0
+    avg_profit = sum(x['profit'] for x in trade_history) / total if total else 0
+    m = f"📊 تقييم البوت:\n\n"
+    m += f"عدد الفرص: {total}\n"
+    m += f"ناجحة: {len(wins)} ✅\n"
+    m += f"فاشلة: {len(losses)} ❌\n"
+    m += f"نسبة النجاح: {win_rate:.0f}%\n"
+    m += f"متوسط الربح: {avg_profit:.0f}%\n\n"
+    m += f"التفاصيل:\n"
+    for x in trade_history:
+        m += f"{x['ticker']} {x['type']} - {x['profit']:.0f}% {'✅' if x['result']=='win' else '❌'}\n"
+    if win_rate >= 60:
+        m += f"\n🎉 البوت ناجح، تقدر تدخل بفلوس حقيقية بحذر"
+    elif win_rate >= 40:
+        m += f"\n⚠️ البوت متوسط، جرب أكثر قبل الفلوس"
+    else:
+        m += f"\n🛑 البوت ضعيف، لا تدخل بفلوس حقيقية"
+    await update.message.reply_text(m)
+
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_trades.pop(update.effective_chat.id, None)
     await update.message.reply_text("مسحت كل شي، نبدأ من جديد ✅")
@@ -231,6 +250,7 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("s", s_cmd))
 app.add_handler(CommandHandler("best", best_cmd))
+app.add_handler(CommandHandler("results", results_cmd))
 app.add_handler(CommandHandler("clear", clear_cmd))
 app.job_queue.run_repeating(check_targets, interval=60, first=10)
 app.run_polling()
