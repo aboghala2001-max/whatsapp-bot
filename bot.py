@@ -15,19 +15,34 @@ def home(): return "Bot is running"
 DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
 
 # ===== اعدادات العقود - منصة سهم =====
-# انت قلت 2-3 عقود، ومو قريبة مرة - نحسب على 2 عشان نكون محافظين
 CONTRACTS = 2
 COMMISSION_PER_CONTRACT = 0.99
 COMMISSION_MIN = 1.99
 VAT = 0.15
-# تكلفة الذهاب والعودة لـ 2 عقود = 4.58$
 COST_TOTAL = (max(COMMISSION_MIN, COMMISSION_PER_CONTRACT * CONTRACTS) * 2) * (1 + VAT)
-TARGET_NET_PROFIT = 5.0 * CONTRACTS  # نبي صافي 5$ لكل عقد = 10$ لـ 2 عقود
-MIN_PROFIT_TOTAL = COST_TOTAL + TARGET_NET_PROFIT  # 14.58$
-MIN_PREMIUM_MOVE = MIN_PROFIT_TOTAL / (CONTRACTS * 100)  # 0.07$ في سعر العقد
-DELTA = 0.35  # محافظ للقريب والبعيد شوي - ATM=0.50 و OTM=0.30 فـ 0.35 يمشي للاثنين
-MIN_STOCK_MOVE = MIN_PREMIUM_MOVE / DELTA  # = 0.20$ في السهم - هذا هو شرط النجاح الجديد
-REVERSAL_PCT = 0.004  # 0.4% انعكاس
+TARGET_NET_PROFIT = 5.0 * CONTRACTS
+MIN_PROFIT_TOTAL = COST_TOTAL + TARGET_NET_PROFIT
+MIN_PREMIUM_MOVE = MIN_PROFIT_TOTAL / (CONTRACTS * 100)
+DELTA = 0.35
+MIN_STOCK_MOVE = MIN_PREMIUM_MOVE / DELTA
+REVERSAL_PCT = 0.004
+
+# ===== اهداف معقولة لكل الشركات - CALL و PUT نفس المنطق =====
+# هادية: هدف 0.5% وقف 0.35% | متوسطة: هدف 0.8-0.9% وقف 0.5% | سريعة: هدف 1.1% وقف 0.7%
+VOLATILITY = {
+    "SPY": (0.005, 0.0035),
+    "QQQ": (0.005, 0.0035),
+    "MSFT": (0.005, 0.0035),
+    "AAPL": (0.006, 0.004),
+    "GOOGL": (0.006, 0.004),
+    "XSP": (0.005, 0.0035),
+    "AMZN": (0.008, 0.005),
+    "NVDA": (0.009, 0.005),
+    "META": (0.008, 0.005),
+    "TSLA": (0.011, 0.007),
+}
+def get_tp_sl(ticker):
+    return VOLATILITY.get(ticker.upper(), (0.007, 0.0045))
 
 # ===== حفظ دائم =====
 def load_json(name, default):
@@ -86,22 +101,23 @@ def get_signal(ticker):
         mom15 = float((close.iloc[-1] / close.iloc[-16] - 1) * 100) if len(close) > 16 else 0
         support = float(close.tail(30).min())
         resist = float(close.tail(30).max())
+        tp, sl = get_tp_sl(ticker)
 
         if price > vwap and 45 <= rsi <= 65 and mom15 > 0.5 and price > sma50:
             option = "CALL 📈"; strength = "قوية جدا 🔥"; duration = "15 - 30 دقيقة"
-            entry = price; target = price * 1.02; stop = price * 0.99
+            entry = price; target = price * (1 + tp); stop = price * (1 - sl)
             reason = "فوق VWAP + RSI متوازن + زخم صاعد"
         elif price > vwap and 40 <= rsi <= 68 and mom15 > 0:
             option = "CALL 📈"; strength = "قوية 💪"; duration = "30 - 60 دقيقة"
-            entry = price; target = price * 1.015; stop = price * 0.988
+            entry = price; target = price * (1 + tp * 0.8); stop = price * (1 - sl)
             reason = "فوق VWAP + زخم صاعد"
         elif price < vwap and 35 <= rsi <= 55 and mom15 < -0.5 and price < sma50:
             option = "PUT 📉"; strength = "قوية جدا 🔥"; duration = "15 - 30 دقيقة"
-            entry = price; target = price * 0.98; stop = price * 1.01
+            entry = price; target = price * (1 - tp); stop = price * (1 + sl)
             reason = "تحت VWAP + RSI نازل + زخم هابط"
         elif price < vwap and 32 <= rsi <= 60 and mom15 < 0:
             option = "PUT 📉"; strength = "قوية 💪"; duration = "30 - 60 دقيقة"
-            entry = price; target = price * 0.985; stop = price * 1.012
+            entry = price; target = price * (1 - tp * 0.8); stop = price * (1 + sl)
             reason = "تحت VWAP + زخم هابط"
         elif rsi > 70 or rsi < 30:
             option = "انتظار ⚠️"; strength = "متوسطة"; duration = "60 - 120 دقيقة"
@@ -139,12 +155,9 @@ async def check_and_send(bot):
             sig_now = get_signal(sym)
             if not sig_now: continue
             cur = sig_now['price']
-
         entry = old['entry']
-        move = cur - entry  # موجب = صعود، سالب = نزول
+        move = cur - entry
         is_call = "CALL" in old['option']
-
-        # --- 1. تنبيه الانعكاس - قبل ما تخلص الفرصة ---
         if not old.get('reversed_alerted'):
             reversed_now = False
             if is_call and move <= -entry * REVERSAL_PCT:
@@ -159,23 +172,17 @@ async def check_and_send(bot):
                 save_json("active.json", ACTIVE_SIGNALS)
                 try: await bot.send_message(chat_id=chat_id, text=txt_rev)
                 except Exception as e: print(f"Reversal send error: {e}")
-
-        # --- 2. تقييم النهاية - للعقود ---
         result = None; reason_txt = ""
-        # الهدف والستوب الاصليين - بس لازم يغطي عمولة العقود
         if is_call:
             if cur >= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
             elif cur <= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
         else:
             if cur <= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
             elif cur >= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
-
         if result is None and (time.time() - old.get('time', time.time()) > 1800):
             result = "timeout"
-
         if result:
             if result == "timeout":
-                # شرط العقود الجديد: لازم يتحرك 0.20$ على الاقل في اتجاهك
                 if is_call:
                     if move >= MIN_STOCK_MOVE:
                         result = "win"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
@@ -279,7 +286,7 @@ def run_bot():
         app_.job_queue.run_repeating(auto_alert, interval=300, first=10)
         print("✅ job_queue OK")
     else:
-        print("⚠️ job_queue missing - using threading fallback (هذا هو الحل)")
+        print("⚠️ job_queue missing - using threading fallback")
         def loop():
             time.sleep(10)
             while True:
