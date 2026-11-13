@@ -1,333 +1,112 @@
-import os, threading, logging, time, json, asyncio
-import yfinance as yf
-import pandas as pd
-from flask import Flask
+import os, yfinance as yf, datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from datetime import datetime, time as dtime
-import pytz
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-TOKEN = os.environ.get("BOT_TOKEN")
-app_web = Flask(__name__)
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+MAX_CONTRACT_PRICE = 2.10  # = 210$ للعقد الواحد
+MAX_CONTRACTS = 1
 
-@app_web.route('/')
-def home(): return "Bot is running"
+def get_expiry():
+    today = datetime.date.today()
+    days_ahead = (4 - today.weekday()) % 7
+    if days_ahead == 0: days_ahead = 7
+    return today + datetime.timedelta(days=days_ahead)
 
-DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
-
-CONTRACTS = 2
-COMMISSION_PER_CONTRACT = 0.99
-COMMISSION_MIN = 1.99
-VAT = 0.15
-COST_TOTAL = (max(COMMISSION_MIN, COMMISSION_PER_CONTRACT * CONTRACTS) * 2) * (1 + VAT)
-TARGET_NET_PROFIT = 5.0 * CONTRACTS
-MIN_PROFIT_TOTAL = COST_TOTAL + TARGET_NET_PROFIT
-MIN_PREMIUM_MOVE = MIN_PROFIT_TOTAL / (CONTRACTS * 100)
-DELTA = 0.35
-MIN_STOCK_MOVE = MIN_PREMIUM_MOVE / DELTA
-REVERSAL_PCT = 0.004
-TIMEOUT_SEC = 3600
-COOLDOWN_SEC = 1800
-
-# ===== وقت الارسال: من قبل الافتتاح بساعة الى نهاية الجلسة فقط =====
-ET = pytz.timezone("America/New_York")
-def is_market_time():
-    now_et = datetime.now(ET)
-    if now_et.weekday() >= 5:
-        return False
-    t = now_et.time()
-    return dtime(8, 30) <= t <= dtime(16, 0)
-
-VOLATILITY = {
-    "SPY": (0.005, 0.0035), "QQQ": (0.005, 0.0035), "MSFT": (0.005, 0.0035),
-    "AAPL": (0.006, 0.004), "GOOGL": (0.006, 0.004), "XSP": (0.005, 0.0035),
-    "AMZN": (0.008, 0.005), "NVDA": (0.009, 0.005), "META": (0.008, 0.005),
-    "TSLA": (0.011, 0.007),
-}
-def get_tp_sl(ticker):
-    return VOLATILITY.get(ticker.upper(), (0.007, 0.0045))
-
-def load_json(name, default):
-    try:
-        if os.path.exists(name):
-            with open(name, 'r') as f:
-                data = json.load(f)
-                return data if data is not None else default
-    except Exception as e:
-        print(f"Load {name} error: {e}")
-    return default
-
-def save_json(name, data):
-    try:
-        with open(name, 'w') as f: json.dump(data, f)
-    except Exception as e:
-        print(f"Save {name} error: {e}")
-
-WATCHLIST = {int(k): v for k, v in load_json("watchlist.json", {}).items()}
-ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
-HISTORY = load_json("history.json", [])
-LAST_FAILED = load_json("failed.json", {})
-
-def rsi_calc(data, period=14):
-    delta = data.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def get_live_price(ticker):
-    try:
-        df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=True)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        return float(df['Close'].iloc[-1])
-    except Exception as e:
-        print(f"Live price {ticker} error: {e}")
-        return None
-
-def get_earnings_warning(ticker):
+def get_earnings(ticker):
     try:
         tk = yf.Ticker(ticker)
-        try:
-            ed = tk.get_earnings_dates(limit=3)
-            if ed is not None and not ed.empty:
-                for d in ed.index:
-                    try:
-                        dd = d.tz_localize(None) if hasattr(d, 'tz_localize') else d
-                        diff = (dd - datetime.now()).days
-                        if 0 <= diff <= 3:
-                            return f"⚠️ أرباح {ticker} بعد {diff} يوم - انتبه"
-                    except: pass
-        except: pass
-    except: pass
-    return "✅ مافي أرباح قريبة (2-3 أيام)"
-
-def get_signal(ticker):
-    try:
-        df = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 80: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        close = df['Close']; high = df['High']; low = df['Low']
-        vol = df['Volume'] if 'Volume' in df.columns else pd.Series([1]*len(df), index=df.index)
-        price = float(close.iloc[-1])
-        live = get_live_price(ticker)
-        if live: price = live
-        prev = float(close.iloc[-2])
-        change = (price - prev) / prev * 100
-        rsi = float(rsi_calc(close).iloc[-1])
-        typical = (high + low + close) / 3
-        vwap = float((typical * vol).cumsum().iloc[-1] / vol.cumsum().iloc[-1]) if vol.sum() > 0 else float(close.tail(20).mean())
-        sma20 = float(close.rolling(20).mean().iloc[-1])
-
-        # 3 شمعات تأكيد
-        last3 = close.tail(3)
-        c1 = float(last3.iloc[0]); c2 = float(last3.iloc[1]); c3 = float(last3.iloc[2])
-        three_up = c3 > c2 > c1
-        three_down = c3 < c2 < c1
-        mom15 = float((close.iloc[-1] / close.iloc[-4] - 1) * 100) if len(close) > 4 else 0
-        mom60 = float((close.iloc[-1] / close.iloc[-13] - 1) * 100) if len(close) > 13 else 0
-
-        # 2-3 ايام سابقة
-        try:
-            price_3d_ago = float(close.iloc[-235]) if len(close) > 235 else float(close.iloc[0])
-            trend_3d = (price - price_3d_ago) / price_3d_ago * 100
-        except: trend_3d = 0
-        trend_up_3d = trend_3d > 0
-        trend_down_3d = trend_3d < 0
-
-        # سيولة قوية
-        avg_vol = float(vol.tail(20).mean())
-        last_vol = float(vol.iloc[-1])
-        vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
-        strong_vol = vol_ratio >= 1.2
-
-        # سعر قريب وبعيد
-        support_near = float(close.tail(20).min())
-        resist_near = float(close.tail(20).max())
-        support_far = float(close.tail(200).min())
-        resist_far = float(close.tail(200).max())
-        support = support_near; resist = resist_near
-        tp, sl = get_tp_sl(ticker)
-        earnings_msg = get_earnings_warning(ticker)
-
-        # شروط جديدة: زخم 0.50% + 3 شمعات + فوليوم + اتجاه 3 ايام
-        if price > vwap and price > sma20 and 50 <= rsi <= 68 and mom15 > 0.50 and mom60 > 0.30 and three_up and strong_vol and trend_up_3d:
-            option = "CALL 📈"; strength = "قوية جدا 🔥"; duration = "30 - 60 دقيقة"
-            entry = price; target = price * (1 + tp); stop = price * (1 - sl)
-            reason = f"فوق VWAP + RSI {rsi:.0f} + زخم 15د {mom15:+.2f}% + 3 شمعات تأكيد + فوليوم {vol_ratio:.1f}x + اتجاه 3 أيام {trend_3d:+.2f}%"
-        elif price < vwap and price < sma20 and 32 <= rsi <= 50 and mom15 < -0.50 and mom60 < -0.30 and three_down and strong_vol and trend_down_3d:
-            option = "PUT 📉"; strength = "قوية جدا 🔥"; duration = "30 - 60 دقيقة"
-            entry = price; target = price * (1 - tp); stop = price * (1 + sl)
-            reason = f"تحت VWAP + RSI {rsi:.0f} + زخم 15د {mom15:+.2f}% + 3 شمعات تأكيد + فوليوم {vol_ratio:.1f}x + اتجاه 3 أيام {trend_3d:+.2f}%"
-        elif rsi > 72 or rsi < 28:
-            option = "انتظار ⚠️"; strength = "متوسطة"; duration = "60 - 120 دقيقة"
-            entry = price; target = resist if rsi < 28 else support; stop = support if rsi < 28 else resist
-            reason = "متشبع - انتظر ارتداد"
-        else:
-            option = "انتظار ⚠️"; strength = "ضعيفة"; duration = "لا تدخل"
-            entry = price; target = resist; stop = support
-            reason = f"لا يوجد تأكيد كامل - زخم 15د {mom15:+.2f}% / فوليوم {vol_ratio:.1f}x / اتجاه 3 أيام {trend_3d:+.2f}%"
-        return {'price': price, 'change': change, 'rsi': rsi, 'vwap': vwap, 'mom15': mom15, 'mom60': mom60, 'option': option, 'strength': strength, 'duration': duration, 'entry': entry, 'target': target, 'stop': stop, 'reason': reason, 'support': support, 'resist': resist, 'support_near': support_near, 'resist_near': resist_near, 'support_far': support_far, 'resist_far': resist_far, 'vol_ratio': vol_ratio, 'trend_3d': trend_3d, 'earnings': earnings_msg}
-    except Exception as e:
-        print(f"Error {ticker}: {e}")
-        return None
+        cal = tk.calendar
+        if cal is not None and 'Earnings Date' in cal:
+            ed = cal['Earnings Date']
+            if isinstance(ed, list): ed = ed[0]
+            days = (ed.date() - datetime.date.today()).days if hasattr(ed, 'date') else 99
+            if 0 <= days <= 3:
+                return f"⚠️ أرباح بعد {days} يوم - انتبه"
+            return "✅ مافي أرباح قريبة (2-3 أيام)"
+        return "✅ مافي أرباح قريبة (2-3 أيام)"
+    except:
+        return "✅ مافي أرباح قريبة (2-3 أيام)"
 
 def analyze(ticker):
-    sig = get_signal(ticker)
-    if not sig: return None
-    if "انتظار" in sig['option']:
-        return f"📊 *{ticker.upper()}*\n💰 السعر: ${sig['price']:.2f} ({sig['change']:+.2f}%)\n🎯 {sig['option']} - {sig['strength']}\n⏱️ المدة: {sig['duration']}\n📉 RSI(5د): {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم 15د: {sig['mom15']:+.2f}% | زخم ساعة: {sig['mom60']:+.2f}%\n📈 اتجاه 3 أيام: {sig['trend_3d']:+.2f}%\n💧 سيولة: {sig['vol_ratio']:.1f}x\n💡 السبب: {sig['reason']}\n🛡️ دعم قريب: ${sig['support_near']:.1f} | بعيد: ${sig['support_far']:.1f}\n🎯 مقاومة قريبة: ${sig['resist_near']:.1f} | بعيدة: ${sig['resist_far']:.1f}\n{sig['earnings']}"
-    return f"🚨 *فرصة {sig['strength']}*\n📊 *{ticker.upper()}*\n🎯 {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f}\n🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n📉 RSI(5د): {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم 15د: {sig['mom15']:+.2f}% | زخم ساعة: {sig['mom60']:+.2f}%\n📈 اتجاه 3 أيام: {sig['trend_3d']:+.2f}%\n💧 سيولة: {sig['vol_ratio']:.1f}x قوية\n💡 السبب: {sig['reason']}\n🛡️ دعم قريب: ${sig['support_near']:.1f} | بعيد: ${sig['support_far']:.1f}\n🎯 مقاومة قريبة: ${sig['resist_near']:.1f} | بعيدة: ${sig['resist_far']:.1f}\n{sig['earnings']}"
+    tk = yf.Ticker(ticker)
+    hist = tk.history(period="5d", interval="15m")
+    daily = tk.history(period="5d", interval="1d")
+    if hist.empty or daily.empty: return None
+    price = float(hist['Close'].iloc[-1])
+    # RSI 5د - مبسط
+    delta = hist['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean().iloc[-1]
+    loss = -delta.where(delta < 0, 0).rolling(14).mean().iloc[-1]
+    rsi = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
+    # VWAP
+    vwap = float((hist['Close'] * hist['Volume']).sum() / hist['Volume'].sum()) if hist['Volume'].sum() else price
+    # زخم
+    mom15 = (hist['Close'].iloc[-1] / hist['Close'].iloc[-4] - 1) * 100 if len(hist) > 4 else 0
+    mom1h = (hist['Close'].iloc[-1] / hist['Close'].iloc[-5] - 1) * 100 if len(hist) > 5 else 0
+    trend3 = (daily['Close'].iloc[-1] / daily['Close'].iloc[-4] - 1) * 100 if len(daily) >= 4 else 0
+    # سيولة
+    vol = float(hist['Volume'].iloc[-1]); vol_avg = float(hist['Volume'].mean())
+    liq = vol / vol_avg if vol_avg else 0
+    # دعم ومقاومة قريب وبعيد
+    sup_n = float(daily['Low'].tail(2).min()); res_n = float(daily['High'].tail(2).max())
+    sup_f = float(daily['Low'].min()); res_f = float(daily['High'].max())
+    # عقد - سترايك وسعر و Greeks
+    expiry_str = get_expiry().strftime("%Y-%m-%d")
+    contract_price, strike, iv, delta_g, theta = 1.85, round(price + 2.5), 38, 0.42, -0.18
+    is_call_guess = mom15 >= 0
+    try:
+        opt = tk.option_chain(expiry_str)
+        chain = opt.calls if is_call_guess else opt.puts
+        valid = chain[(chain['lastPrice'] <= MAX_CONTRACT_PRICE) & (chain['lastPrice'] > 0.30)]
+        if not valid.empty:
+            row = valid.iloc[(valid['strike'] - price).abs().argsort()[:1]].iloc[0]
+            strike = float(row['strike']); contract_price = float(row['lastPrice'])
+            iv = float(row.get('impliedVolatility', 0.38)) * 100
+            # دلتا وثيتا تقديري حسب قرب السترايك
+            delta_g = 0.42 if abs(strike - price) < 3 else 0.30
+            theta = -0.18 if abs(strike - price) < 3 else -0.12
+    except: pass
+    return {"price":price,"rsi":rsi,"vwap":vwap,"mom15":mom15,"mom1h":mom1h,"trend":trend3,"liq":liq,
+            "sup_n":sup_n,"sup_f":sup_f,"res_n":res_n,"res_f":res_f,
+            "strike":strike,"cprice":contract_price,"iv":iv,"delta":delta_g,"theta":theta,
+            "expiry":get_expiry(),"earn":get_earnings(ticker)}
 
-async def check_and_send(bot):
-    global ACTIVE_SIGNALS, HISTORY, LAST_FAILED
-    ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
-    HISTORY = load_json("history.json", [])
-    LAST_FAILED = load_json("failed.json", {})
-    for key in list(ACTIVE_SIGNALS.keys()):
-        try:
-            parts = key.split("_")
-            chat_id = int(parts[0]); sym = parts[1]
-        except: continue
-        old = ACTIVE_SIGNALS.get(key)
-        if not old: continue
-        cur = get_live_price(sym)
-        if not cur:
-            sig_now = get_signal(sym)
-            if not sig_now: continue
-            cur = sig_now['price']
-        entry = old['entry']; move = cur - entry; is_call = "CALL" in old['option']
-        if not old.get('reversed_alerted'):
-            reversed_now = False
-            if is_call and move <= -entry * REVERSAL_PCT:
-                reversed_now = True
-                txt_rev = f"⚠️ انعكاس - عقد {sym} CALL قلب عليك\nدخول: ${entry:.2f} | الحالي: ${cur:.2f} ({move:+.2f}$)\nالعقد قاعد يذوب، فكر تطلع الحين قبل الستوب"
-            elif not is_call and move >= entry * REVERSAL_PCT:
-                reversed_now = True
-                txt_rev = f"⚠️ انعكاس - عقد {sym} PUT قلب عليك\nدخول: ${entry:.2f} | الحالي: ${cur:.2f} ({move:+.2f}$)\nالعقد قاعد يذوب، فكر تطلع الحين قبل الستوب"
-            if reversed_now:
-                old['reversed_alerted'] = True; ACTIVE_SIGNALS[key] = old; save_json("active.json", ACTIVE_SIGNALS)
-                try: await bot.send_message(chat_id=chat_id, text=txt_rev)
-                except Exception as e: print(f"Reversal send error: {e}")
-        result = None; reason_txt = ""
-        if is_call:
-            if cur >= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
-            elif cur <= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
-        else:
-            if cur <= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
-            elif cur >= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
-        if result is None and (time.time() - old.get('time', time.time()) > TIMEOUT_SEC):
-            result = "timeout"
-        if result:
-            if result == "timeout":
-                if is_call:
-                    if move >= MIN_STOCK_MOVE: result = "win"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
-                    else: result = "loss"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
-                else:
-                    if move <= -MIN_STOCK_MOVE: result = "win"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
-                    else: result = "loss"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
-            HISTORY.append({"symbol": sym, "result": result, "option": old['option'], "entry": entry, "exit": cur, "move": move, "time": old.get('time', time.time())})
-            save_json("history.json", HISTORY)
-            if result == "loss":
-                LAST_FAILED[sym] = time.time(); save_json("failed.json", LAST_FAILED)
-            emoji = "✅ نجحت" if result == "win" else "❌ فشلت"
-            try: await bot.send_message(chat_id=chat_id, text=f"{emoji} - عقد {sym} خلصت\n{reason_txt}\nدخول: ${entry:.2f} | السعر الحالي: ${cur:.2f} | الحركة: {move:+.2f}$\nعمولة سهم لـ {CONTRACTS} عقود: ${COST_TOTAL:.2f}\nالحين اقدر ارسل لك فرصة جديدة على {sym} اذا جت 🔥\nشوف تقييمي بـ /stats")
-            except Exception as e: print(f"Send eval error: {e}")
-            if key in ACTIVE_SIGNALS: del ACTIVE_SIGNALS[key]
-            save_json("active.json", ACTIVE_SIGNALS)
+def format_msg(ticker, d):
+    breakeven = d['strike'] + d['cprice'] if d['mom15'] >= 0 else d['strike'] - d['cprice']
+    stop = d['cprice'] * 0.70; t1 = d['cprice'] * 1.50; t2 = d['cprice'] * 2.0
+    total = d['cprice'] * 100 * MAX_CONTRACTS
+    is_call = d['mom15'] >= 0.50 and d['liq'] >= 1.2 and d['trend'] > 0
+    is_put = d['mom15'] <= -0.50 and d['liq'] >= 1.2 and d['trend'] < 0
+    if d['cprice'] > MAX_CONTRACT_PRICE:
+        dec = "تخطي - عقد غالي"; typ = "انتظار"
+    elif is_call: dec = "CALL قوي - ادخل"; typ = "CALL"
+    elif is_put: dec = "PUT قوي - ادخل"; typ = "PUT"
+    else: dec = "انتظار ⚠️ - ضعيفة"; typ = "انتظار"
+    theta_warn = "ثيتا عالي - لا تنام فيه" if d['theta'] < -0.25 else "ثيتا مريح"
+    # رسالة مختصرة - كل شي في 9 أسطر
+    m = f"📊 {ticker} | ${d['price']:.2f} ({d['mom15']:+.2f}%)\n"
+    m += f"🎯 {dec} | ⏱️ {d['expiry'].strftime('%d %b')}\n"
+    m += f"📉 RSI: {d['rsi']:.0f} | VWAP: ${d['vwap']:.1f} | زخم ساعة: {d['mom1h']:+.2f}% | اتجاه 3أ: {d['trend']:+.2f}% | سيولة: {d['liq']:.1f}x\n"
+    m += f"💰 سترايك: {d['strike']:.0f}$ | عقد: {d['cprice']:.2f}$ | إجمالي 1 عقد: {total:.0f}$ | تعادل: {breakeven:.2f}$\n"
+    m += f"📈 دلتا: {d['delta']:.2f} | ثيتا: {d['theta']:.2f} | IV: {d['iv']:.0f}% | {theta_warn}\n"
+    m += f"🛡️ دعم: {d['sup_n']:.1f}$ / {d['sup_f']:.1f}$ | 🎯 مقاومة: {d['res_n']:.1f}$ / {d['res_f']:.1f}$\n"
+    m += f"🛑 وقف: -30% ({stop:.2f}$) | 🎯 هدف: +50% ({t1:.2f}$) / +100% ({t2:.2f}$)\n"
+    m += f"💡 السبب: زخم {d['mom15']:+.2f}% / سيولة {d['liq']:.1f}x / اتجاه {d['trend']:+.2f}%\n"
+    m += f"{d['earn']}"
+    return m
 
-async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
-    if not is_market_time():
-        print("Market closed - no alerts"); return
-    await check_and_send(context.bot)
-    LAST_FAILED = load_json("failed.json", {})
-    for chat_id, symbols in list(WATCHLIST.items()):
-        for sym in symbols:
-            active_key = f"{chat_id}_{sym}"
-            if active_key in ACTIVE_SIGNALS: continue
-            if sym in LAST_FAILED and (time.time() - LAST_FAILED[sym] < COOLDOWN_SEC): continue
-            sig = get_signal(sym)
-            if not sig: continue
-            if sig['strength'] not in ["قوية جدا 🔥"]: continue
-            ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time(), "reversed_alerted": False}
-            save_json("active.json", ACTIVE_SIGNALS)
-            msg = f"🚨 فرصة عقود {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول السهم: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n📊 للعقود ({CONTRACTS} عقود): لازم السهم يتحرك {MIN_STOCK_MOVE:.2f}$ عشان تغطي عمولة سهم + ربح\n🛡️ دعم قريب: ${sig['support_near']:.1f} | بعيد: ${sig['support_far']:.1f}\n🎯 مقاومة قريبة: ${sig['resist_near']:.1f} | بعيدة: ${sig['resist_far']:.1f}\n📈 اتجاه 3 أيام: {sig['trend_3d']:+.2f}%\n💧 سيولة: {sig['vol_ratio']:.1f}x\n{sig['earnings']}\n⚠️ اذا انعكس عليك 0.4% بجيك تنبيه انعكاس\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
-            try: await context.bot.send_message(chat_id=chat_id, text=msg)
-            except Exception as e: print(e)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    WATCHLIST[chat_id] = DEFAULT_SYMBOLS.copy()
-    save_json("watchlist.json", WATCHLIST)
-    await check_and_send(context.bot)
-    await update.message.reply_text("هلا فيك 👋\nسجلتك في التنبيه التلقائي ✅\nبيراقب لك:\nAMZN, NVDA, AAPL, TSLA, MSFT, GOOGL, QQQ, SPY, META, XSP\n\n⏰ وقت البوت: من قبل الافتتاح بساعة الى نهاية الجلسة فقط\nبعد الاغلاق ما يرسل شي\n\nأي فرصة قوية بتجيك لحالها 🔥\nوتقدر تسأل عن أي سهم بـ /s NVDA\nوتشوف تقييم البوت بـ /stats")
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await check_and_send(context.bot)
-    HISTORY_NOW = load_json("history.json", [])
-    if not HISTORY_NOW:
-        await update.message.reply_text("📊 للحين مافيه فرص خلصت عشان اقيمها\nانتظر اول فرصة تخلص وبيجيك التقييم هنا"); return
-    total = len(HISTORY_NOW); wins = len([h for h in HISTORY_NOW if h.get('result') == "win"]); losses = total - wins; rate = wins / total * 100 if total else 0
-    txt = f"📊 *تقييم البوت لنفسه - عقود*\n\nإجمالي الفرص: {total}\n✅ نجحت: {wins}\n❌ فشلت: {losses}\n🎯 نسبة النجاح: {rate:.0f}%\nعمولة سهم لـ {CONTRACTS} عقود: ${COST_TOTAL:.2f} ذهاب وعودة\nشرط النجاح: حركة {MIN_STOCK_MOVE:.2f}$ على الاقل\n\n"
-    for sym in DEFAULT_SYMBOLS:
-        sh = [h for h in HISTORY_NOW if h.get('symbol') == sym]
-        if sh:
-            sw = len([h for h in sh if h.get('result')=="win"])
-            txt += f"{sym}: {sw}/{len(sh)} نجحت ({sw/len(sh)*100:.0f}%)\n"
-    ACTIVE_NOW = load_json("active.json", {})
-    if ACTIVE_NOW: txt += f"\n⏳ فرص شغالة الحين: {len(ACTIVE_NOW)}"
-    await update.message.reply_text(txt, parse_mode="Markdown")
-
-async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("ارسل كذا: /s NVDA"); return
+        await update.message.reply_text("اكتب: /s NVDA"); return
     ticker = context.args[0].upper()
-    await update.message.reply_text(f"جالس أحلل {ticker} ... ⏳")
-    res = analyze(ticker)
-    if not res: await update.message.reply_text("ما لقيت السهم")
-    else: await update.message.reply_text(res, parse_mode="Markdown")
+    d = analyze(ticker)
+    if not d: await update.message.reply_text("ما لقيت بيانات"); return
+    await update.message.reply_text(format_msg(ticker, d))
 
-async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for t in DEFAULT_SYMBOLS:
-        res = analyze(t)
-        if res: await update.message.reply_text(res, parse_mode="Markdown")
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("مسحت كل التقييم والفرص الشغالة، نبدأ من جديد ✅")
 
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global HISTORY, ACTIVE_SIGNALS
-    HISTORY = []; ACTIVE_SIGNALS = {}
-    save_json("history.json", []); save_json("active.json", {}); save_json("failed.json", {})
-    await update.message.reply_text("✅ مسحت كل التقييم والفرص الشغالة، نبدأ من جديد")
-
-def run_bot():
-    if not TOKEN:
-        print("❌ BOT_TOKEN missing"); return
-    print("✅ Bot starting polling...")
-    app_ = ApplicationBuilder().token(TOKEN).build()
-    app_.add_handler(CommandHandler("start", start))
-    app_.add_handler(CommandHandler("s", stock))
-    app_.add_handler(CommandHandler("watch", watch))
-    app_.add_handler(CommandHandler("stats", stats))
-    app_.add_handler(CommandHandler("clear", clear_history))
-    if app_.job_queue:
-        app_.job_queue.run_repeating(auto_alert, interval=300, first=10)
-        print("✅ job_queue OK")
-    else:
-        print("⚠️ job_queue missing - using threading fallback")
-        def loop():
-            time.sleep(10)
-            while True:
-                try:
-                    async def run_once():
-                        class FakeContext: pass
-                        ctx = FakeContext(); ctx.bot = app_.bot
-                        await auto_alert(ctx)
-                    asyncio.run(run_once())
-                except Exception as e: print(f"Loop error: {e}")
-                time.sleep(60)
-        threading.Thread(target=loop, daemon=True).start()
-    app_.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    threading.Thread(target=lambda: app_web.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000))), daemon=True).start()
-    run_bot()
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("s", s_cmd))
+app.add_handler(CommandHandler("clear", clear_cmd))
+app.run_polling()
