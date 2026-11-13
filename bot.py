@@ -11,6 +11,8 @@ app_web = Flask(__name__)
 @app_web.route('/')
 def home(): return "Bot is running"
 
+# القائمة اللي بيراقبها تلقائي
+DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
 WATCHLIST = {}
 ALERTED = {}
 
@@ -31,67 +33,35 @@ def get_signal(ticker):
         prev = float(close.iloc[-2])
         change = (price - prev) / prev * 100
         sma50 = float(close.rolling(50).mean().iloc[-1])
-        sma200 = float(close.rolling(200).mean().iloc[-1])
         rsi = float(rsi_calc(close).iloc[-1])
         vwap = float(close.tail(20).mean())
         mom15 = float((close.iloc[-1] / close.iloc[-16] - 1) * 100) if len(close) > 16 else 0
         support = float(close.tail(30).min())
         resist = float(close.tail(30).max())
 
-        # --- منطق الفرص القوية ---
-        # CALL قوية جدا
         if price > vwap and 45 <= rsi <= 65 and mom15 > 0.5 and price > sma50:
-            option = "CALL 📈"
-            strength = "قوية جدا 🔥"
-            duration = "15 - 30 دقيقة"
-            entry = price
-            target = price * 1.02
-            stop = price * 0.99
+            option = "CALL 📈"; strength = "قوية جدا 🔥"; duration = "15 - 30 دقيقة"
+            entry = price; target = price * 1.02; stop = price * 0.99
             reason = "فوق VWAP + RSI متوازن + زخم صاعد"
-        # CALL قوية
         elif price > vwap and 40 <= rsi <= 68 and mom15 > 0:
-            option = "CALL 📈"
-            strength = "قوية 💪"
-            duration = "30 - 60 دقيقة"
-            entry = price
-            target = price * 1.015
-            stop = price * 0.988
+            option = "CALL 📈"; strength = "قوية 💪"; duration = "30 - 60 دقيقة"
+            entry = price; target = price * 1.015; stop = price * 0.988
             reason = "فوق VWAP + زخم صاعد"
-        # PUT قوية جدا
         elif price < vwap and 35 <= rsi <= 55 and mom15 < -0.5 and price < sma50:
-            option = "PUT 📉"
-            strength = "قوية جدا 🔥"
-            duration = "15 - 30 دقيقة"
-            entry = price
-            target = price * 0.98
-            stop = price * 1.01
+            option = "PUT 📉"; strength = "قوية جدا 🔥"; duration = "15 - 30 دقيقة"
+            entry = price; target = price * 0.98; stop = price * 1.01
             reason = "تحت VWAP + RSI نازل + زخم هابط"
-        # PUT قوية
         elif price < vwap and 32 <= rsi <= 60 and mom15 < 0:
-            option = "PUT 📉"
-            strength = "قوية 💪"
-            duration = "30 - 60 دقيقة"
-            entry = price
-            target = price * 0.985
-            stop = price * 1.012
+            option = "PUT 📉"; strength = "قوية 💪"; duration = "30 - 60 دقيقة"
+            entry = price; target = price * 0.985; stop = price * 1.012
             reason = "تحت VWAP + زخم هابط"
-        # متوسطة
         elif rsi > 70 or rsi < 30:
-            option = "انتظار ⚠️"
-            strength = "متوسطة"
-            duration = "60 - 120 دقيقة"
-            entry = price
-            target = resist if rsi < 30 else support
-            stop = support if rsi < 30 else resist
+            option = "انتظار ⚠️"; strength = "متوسطة"; duration = "60 - 120 دقيقة"
+            entry = price; target = resist if rsi < 30 else support; stop = support if rsi < 30 else resist
             reason = "متشبع - انتظر ارتداد"
         else:
-            option = "انتظار ⚠️"
-            strength = "ضعيفة"
-            duration = "لا تدخل"
-            entry = price
-            target = resist
-            stop = support
-            reason = "لا يوجد تأكيد"
+            option = "انتظار ⚠️"; strength = "ضعيفة"; duration = "لا تدخل"
+            entry = price; target = resist; stop = support; reason = "لا يوجد تأكيد"
 
         return {'price': price, 'change': change, 'rsi': rsi, 'vwap': vwap, 'mom15': mom15, 'option': option, 'strength': strength, 'duration': duration, 'entry': entry, 'target': target, 'stop': stop, 'reason': reason, 'support': support, 'resist': resist}
     except Exception as e:
@@ -124,7 +94,9 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
                 print(e)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("هلا فيك 👋\nارسل /s AAPL لتحليل أي سهم\nالفرص القوية بس هي اللي تجيك تنبيه")
+    chat_id = update.effective_chat.id
+    WATCHLIST[chat_id] = DEFAULT_SYMBOLS.copy()
+    await update.message.reply_text("هلا فيك 👋\nسجلتك في التنبيه التلقائي ✅\nبيراقب لك:\nAMZN, NVDA, AAPL, TSLA, MSFT, GOOGL, QQQ, SPY, META, XSP\n\nأي فرصة قوية بتجيك لحالها 🔥\nوتقدر تسأل عن أي سهم بـ /s NVDA")
 
 async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -136,7 +108,7 @@ async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: await update.message.reply_text(res, parse_mode="Markdown")
 
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for t in ["AAPL","NVDA","TSLA","MSFT"]:
+    for t in DEFAULT_SYMBOLS:
         res = analyze(t)
         if res: await update.message.reply_text(res, parse_mode="Markdown")
 
