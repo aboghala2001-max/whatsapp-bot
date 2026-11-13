@@ -2,7 +2,7 @@ import os, yfinance as yf, datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 MAX_CONTRACT_PRICE = 2.10  # = 210$ للعقد الواحد
 MAX_CONTRACTS = 1
 
@@ -38,7 +38,7 @@ def analyze(ticker):
     gain = delta.where(delta > 0, 0).rolling(14).mean().iloc[-1]
     loss = -delta.where(delta < 0, 0).rolling(14).mean().iloc[-1]
     rsi = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
-    # VWAP
+    # VWAP - مصلح
     vwap = float((hist['Close'] * hist['Volume']).sum() / hist['Volume'].sum()) if hist['Volume'].sum() else price
     # زخم
     mom15 = (hist['Close'].iloc[-1] / hist['Close'].iloc[-4] - 1) * 100 if len(hist) > 4 else 0
@@ -62,7 +62,6 @@ def analyze(ticker):
             row = valid.iloc[(valid['strike'] - price).abs().argsort()[:1]].iloc[0]
             strike = float(row['strike']); contract_price = float(row['lastPrice'])
             iv = float(row.get('impliedVolatility', 0.38)) * 100
-            # دلتا وثيتا تقديري حسب قرب السترايك
             delta_g = 0.42 if abs(strike - price) < 3 else 0.30
             theta = -0.18 if abs(strike - price) < 3 else -0.12
     except: pass
@@ -83,7 +82,6 @@ def format_msg(ticker, d):
     elif is_put: dec = "PUT قوي - ادخل"; typ = "PUT"
     else: dec = "انتظار ⚠️ - ضعيفة"; typ = "انتظار"
     theta_warn = "ثيتا عالي - لا تنام فيه" if d['theta'] < -0.25 else "ثيتا مريح"
-    # رسالة مختصرة - كل شي في 9 أسطر
     m = f"📊 {ticker} | ${d['price']:.2f} ({d['mom15']:+.2f}%)\n"
     m += f"🎯 {dec} | ⏱️ {d['expiry'].strftime('%d %b')}\n"
     m += f"📉 RSI: {d['rsi']:.0f} | VWAP: ${d['vwap']:.1f} | زخم ساعة: {d['mom1h']:+.2f}% | اتجاه 3أ: {d['trend']:+.2f}% | سيولة: {d['liq']:.1f}x\n"
