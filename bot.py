@@ -28,7 +28,6 @@ MIN_STOCK_MOVE = MIN_PREMIUM_MOVE / DELTA
 REVERSAL_PCT = 0.004
 
 # ===== اهداف معقولة لكل الشركات - CALL و PUT نفس المنطق =====
-# هادية: هدف 0.5% وقف 0.35% | متوسطة: هدف 0.8-0.9% وقف 0.5% | سريعة: هدف 1.1% وقف 0.7%
 VOLATILITY = {
     "SPY": (0.005, 0.0035),
     "QQQ": (0.005, 0.0035),
@@ -44,7 +43,6 @@ VOLATILITY = {
 def get_tp_sl(ticker):
     return VOLATILITY.get(ticker.upper(), (0.007, 0.0045))
 
-# ===== حفظ دائم =====
 def load_json(name, default):
     try:
         if os.path.exists(name):
@@ -66,7 +64,6 @@ ALERTED = {}
 ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
 HISTORY = load_json("history.json", [])
 
-# ===== مؤشرات =====
 def rsi_calc(data, period=14):
     delta = data.diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
@@ -138,7 +135,6 @@ def analyze(ticker):
         return f"📊 *{ticker.upper()}*\n💰 السعر: ${sig['price']:.2f} ({sig['change']:+.2f}%)\n🎯 {sig['option']} - {sig['strength']}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
     return f"🚨 *فرصة {sig['strength']}*\n📊 *{ticker.upper()}*\n🎯 {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f}\n🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
 
-# ===== التقييم - نسخة العقود =====
 async def check_and_send(bot):
     global ACTIVE_SIGNALS, HISTORY
     ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
@@ -212,10 +208,8 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
             sig = get_signal(sym)
             if not sig: continue
             if sig['strength'] not in ["قوية جدا 🔥", "قوية 💪"]: continue
-            key = f"{chat_id}_{sym}_{sig['option']}"
-            last_price = ALERTED.get(key, 0)
-            if abs(sig['price'] - last_price) < 1: continue
-            ALERTED[key] = sig['price']
+            # تم الغاء شرط الـ 1$ - كان يمنع ارسال الفرص الجديدة
+            # الحين اذا مافيه فرصة شغالة على نفس السهم، يرسل على طول
             ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time(), "reversed_alerted": False}
             save_json("active.json", ACTIVE_SIGNALS)
             msg = f"🚨 فرصة عقود {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول السهم: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n📊 للعقود ({CONTRACTS} عقود): لازم السهم يتحرك {MIN_STOCK_MOVE:.2f}$ عشان تغطي عمولة سهم + ربح\n⚠️ اذا انعكس عليك 0.4% بجيك تنبيه انعكاس\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
