@@ -1,4 +1,4 @@
-import os, asyncio, threading, requests
+import os, asyncio, threading, requests, csv, io
 asyncio.set_event_loop(asyncio.new_event_loop())
 from flask import Flask
 from telegram import Update
@@ -33,37 +33,37 @@ def calc_rsi(closes, period=14):
 def get_analysis(symbol):
     try:
         symbol = symbol.upper().strip()
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=3mo&interval=1d"
+        # Stooq - شغال بدون حظر
+        url = f"https://stooq.com/q/d/l/?s={symbol.lower()}.us&i=d"
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=15)
-        data = r.json()
-        result = data["chart"]["result"][0]
-        meta = result["meta"]
-        price = meta["regularMarketPrice"]
-        prev = meta["previousClose"]
+        if "Date" not in r.text or len(r.text) < 100:
+            return f"ما لقيت السهم {symbol} ❌\nجرب: /s AAPL\nتأكد انه سهم أمريكي"
+        
+        reader = csv.DictReader(io.StringIO(r.text))
+        rows = list(reader)
+        rows = [x for x in rows if x['Close'] != 'N/D']
+        if len(rows) < 10:
+            return f"ما لقيت بيانات كافية لـ {symbol}"
+
+        closes = [float(x['Close']) for x in rows]
+        highs = [float(x['High']) for x in rows]
+        lows = [float(x['Low']) for x in rows]
+
+        price = closes[-1]
+        prev = closes[-2]
         change = price - prev
         change_pct = (change / prev) * 100
 
-        q = result["indicators"]["quote"][0]
-        closes = [c for c in q["close"] if c is not None]
-        volumes = [v for v in q["volume"] if v is not None]
-        highs = [h for h in q["high"] if h is not None]
-        lows = [l for l in q["low"] if l is not None]
-
-        # متوسطات
         sma20 = sum(closes[-20:]) / min(20, len(closes))
         sma50 = sum(closes[-50:]) / min(50, len(closes)) if len(closes) >= 50 else sum(closes)/len(closes)
         rsi = calc_rsi(closes)
 
-        # دعم ومقاومة - آخر 20 يوم
         support = min(lows[-20:])
         resistance = max(highs[-20:])
-
-        # تغير
         change_5d = ((closes[-1] - closes[-6]) / closes[-6]) * 100 if len(closes) >= 6 else 0
         change_1m = ((closes[-1] - closes[-22]) / closes[-22]) * 100 if len(closes) >= 22 else 0
 
-        # تحديد الاتجاه
         if price > sma20 and price > sma50 and rsi >= 50:
             trend = "صاعد 📈"
             decision = "الاتجاه العام صاعد، الشراء مع أي نزول للدعم أفضل"
@@ -74,7 +74,6 @@ def get_analysis(symbol):
             trend = "متذبذب ↔️"
             decision = "السهم متذبذب بين الدعم والمقاومة، انتظر اختراق"
 
-        # RSI تفسير
         if rsi >= 70:
             rsi_txt = f"{rsi:.0f} - تشبع شراء ⚠️"
         elif rsi <= 30:
@@ -82,7 +81,6 @@ def get_analysis(symbol):
         else:
             rsi_txt = f"{rsi:.0f} - طبيعي"
 
-        # قوة
         if abs(change_pct) >= 3:
             power = "حركة قوية اليوم 🔥"
         elif abs(change_pct) >= 1:
@@ -110,10 +108,10 @@ def get_analysis(symbol):
 """
         return msg
     except Exception as e:
-        return f"ما لقيت السهم {symbol} ❌\nجرب: /s NVDA"
+        return f"صار خطأ، جرب مرة ثانية: /s {symbol}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("شغال ✅\nارسل /s NVDA عشان اجيب لك تحليل كامل ومختصر")
+    await update.message.reply_text("شغال ✅\nارسل /s NVDA")
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
