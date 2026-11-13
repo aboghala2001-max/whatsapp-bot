@@ -16,20 +16,20 @@ def keep_alive():
 threading.Thread(target=keep_alive, daemon=True).start()
 
 MAX_CONTRACT_PRICE = 2.10
-COMMISSION = 4.58
-SUCCESS_MOVE = 0.20
-REVERSAL_PCT = 0.40
 active_trades = {}
-trade_history = []  # سجل التقييم
+trade_history = []
 BEST_TICKERS = ["NVDA","TSLA","AAPL","MSFT","AMZN","META","AMD","NFLX","GOOGL","AVGO","PLTR","COIN",
                 "JPM","V","MA","BAC","GS","UNH","JNJ","LLY","ABBV","WMT","COST","HD","PG","DIS",
                 "XOM","CAT","ORCL","CRM","ADBE","SPY","QQQ"]
 
-def get_expiry():
+def get_expiry_daily():
+    # كل الفرص يومية - نفس يوم التداول فقط
     today = datetime.date.today()
-    days_ahead = (4 - today.weekday()) % 7
-    if days_ahead == 0: days_ahead = 7
-    return today + datetime.timedelta(days=days_ahead)
+    # اذا اليوم سبت 14 -> الاثنين 16، اذا أحد -> الاثنين 16، غيره نفس اليوم
+    entry = today
+    while entry.weekday() >= 5:
+        entry += datetime.timedelta(days=1)
+    return entry
 
 def get_market_trend():
     try:
@@ -76,6 +76,12 @@ def analyze(ticker):
     daily = tk.history(period="5d", interval="1d")
     if hist.empty or daily.empty: return None
     price = float(hist['Close'].iloc[-1])
+    sup_n = float(daily['Low'].tail(2).min())
+    res_n = float(daily['High'].tail(2).max())
+    if sup_n > price or res_n < price or abs(sup_n - price) / price > 0.08 or abs(res_n - price) / price > 0.08:
+        recent = hist.tail(40)
+        sup_n = float(recent['Low'].min())
+        res_n = float(recent['High'].max())
     delta = hist['Close'].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean().iloc[-1]
     loss = -delta.where(delta < 0, 0).rolling(14).mean().iloc[-1]
@@ -86,37 +92,38 @@ def analyze(ticker):
     trend3 = (daily['Close'].iloc[-1] / daily['Close'].iloc[-4] - 1) * 100 if len(daily) >= 4 else 0
     vol = float(hist['Volume'].iloc[-1]); vol_avg = float(hist['Volume'].mean())
     liq = vol / vol_avg if vol_avg else 0
-    sup_n = float(daily['Low'].tail(2).min()); res_n = float(daily['High'].tail(2).max())
-    sup_f = float(daily['Low'].min()); res_f = float(daily['High'].max())
-    expiry = get_expiry()
+
+    # فقط فرص يومية - ألغينا يومين و 3 أيام
+    duration = "15 - 30 دقيقة"
+    cont_type = "short"
+    # إذا ما فيه استمرارية قصيرة، نعتبرها انتظار، ولا نعطي فرصة طويلة
+    cont_short_up = mom15 >= 0.50 and mom1h >= 0 and trend3 > 0
+    cont_short_down = mom15 <= -0.50 and mom1h <= 0 and trend3 < 0
+    if not (cont_short_up or cont_short_down):
+        cont_type = "none"
+
+    expiry = get_expiry_daily()
     expiry_str = expiry.strftime("%Y-%m-%d")
     is_call_guess = mom15 >= 0
-    strike = round(price + 2.5) if is_call_guess else round(price - 2.5)
-    contract_price, iv, delta_g, theta = 1.85, 38, 0.42, -0.18
+    atm = round(price / 5) * 5
+    strike = float(atm)
+    contract_price, iv = None, 38
     try:
         opt = tk.option_chain(expiry_str)
         chain = opt.calls if is_call_guess else opt.puts
+        chain = chain[abs(chain['strike'] - price) <= 10]
         valid = chain[(chain['lastPrice'] <= MAX_CONTRACT_PRICE) & (chain['lastPrice'] > 0.30)]
         if not valid.empty:
-            row = valid.iloc[(valid['strike'] - price).abs().argsort()[:1]].iloc[0]
+            valid = valid.copy()
+            valid['dist'] = abs(valid['strike'] - price)
+            valid = valid.sort_values('dist')
+            row = valid.iloc[0]
             strike = float(row['strike']); contract_price = float(row['lastPrice'])
             iv = float(row.get('impliedVolatility', 0.38)) * 100
-            delta_g = 0.42 if abs(strike - price) < 3 else 0.30
-            theta = -0.18 if abs(strike - price) < 3 else -0.12
-    except: pass
-    cont_short_up = mom15 >= 0.50 and mom1h >= 0 and trend3 > 0
-    cont_short_down = mom15 <= -0.50 and mom1h <= 0 and trend3 < 0
-    cont_long_up = abs(trend3) >= 2 and trend3 > 0 and mom15 >= 0 and mom1h >= 0
-    cont_long_down = abs(trend3) >= 2 and trend3 < 0 and mom15 <= 0 and mom1h <= 0
-    if cont_short_up or cont_short_down:
-        duration = "15 - 30 دقيقة"
-        cont_type = "short"
-    elif cont_long_up or cont_long_down:
-        duration = "يومين - 3 أيام"
-        cont_type = "long"
-    else:
-        duration = "15 - 30 دقيقة"
-        cont_type = "none"
+    except:
+        pass
+    if contract_price is None:
+        return None
     spy_mom, spy_trend = get_market_trend()
     score = abs(mom15)*3 + abs(trend3)*2 + min(liq,5)*2
     if cont_type != "none": score += 10
@@ -124,8 +131,8 @@ def analyze(ticker):
     if (mom15 > 0 and spy_mom >= 0) or (mom15 < 0 and spy_mom <= 0): score += 5
     if (mom15 > 0 and price > vwap) or (mom15 < 0 and price < vwap): score += 5
     return {"price":price,"rsi":rsi,"vwap":vwap,"mom15":mom15,"mom1h":mom1h,"trend":trend3,"liq":liq,
-            "sup_n":sup_n,"sup_f":sup_f,"res_n":res_n,"res_f":res_f,
-            "strike":strike,"cprice":contract_price,"iv":iv,"delta":delta_g,"theta":theta,
+            "sup_n":sup_n,"sup_f":float(daily['Low'].min()),"res_n":res_n,"res_f":float(daily['High'].max()),
+            "strike":strike,"cprice":contract_price,"iv":iv,"delta":0.42,"theta":-0.18,
             "expiry":expiry,"earn":get_earnings(ticker),"is_call_guess":is_call_guess,"duration":duration,"cont_type":cont_type,"score":score,
             "spy_mom":spy_mom,"spy_trend":spy_trend}
 
@@ -134,15 +141,16 @@ def format_msg(ticker, d):
     t1 = d['cprice'] * 1.50
     t2 = d['cprice'] * 2.0
     bad, bad_reason = is_bad_time()
-    is_call = d['cont_type'] in ("short","long") and d['mom15'] >= 0 and d['trend'] > 0 and d['liq'] >= 1.2 and d['price'] > d['vwap'] and d['spy_mom'] >= 0 and not bad
-    is_put = d['cont_type'] in ("short","long") and d['mom15'] <= 0 and d['trend'] < 0 and d['liq'] >= 1.2 and d['price'] < d['vwap'] and d['spy_mom'] <= 0 and not bad
+    # كل الشروط لازم تتوفر، ولا ما يعطي CALL ولا PUT
+    is_call = d['cont_type'] == "short" and d['mom15'] >= 0 and d['trend'] > 0 and d['liq'] >= 1.2 and d['price'] > d['vwap'] and d['spy_mom'] >= 0 and not bad
+    is_put = d['cont_type'] == "short" and d['mom15'] <= 0 and d['trend'] < 0 and d['liq'] >= 1.2 and d['price'] < d['vwap'] and d['spy_mom'] <= 0 and not bad
     if d['cprice'] > MAX_CONTRACT_PRICE: dec = "تخطي"
     elif is_call: dec = "CALL"
     elif is_put: dec = "PUT"
     else: dec = "انتظار ⚠️"
     m = f"📊 {ticker}\n"
-    m += f"سترايك {d['strike']:.0f}$ - {dec}\n"
-    m += f"السعر {d['cprice']:.2f}$\n"
+    m += f"سعر السهم {d['price']:.1f}$ | سترايك {d['strike']:.0f}$ - {dec}\n"
+    m += f"السعر {d['cprice']:.2f}$ - ماكس 2.10$\n"
     m += f"التاريخ {d['expiry'].strftime('%d %b')} - المدة {d['duration']}\n"
     m += f"الدعم {d['sup_n']:.1f}$ | المقاومة {d['res_n']:.1f}$\n"
     m += f"الوقف {stop:.2f}$\n"
@@ -182,7 +190,7 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اكتب: /s NVDA"); return
     ticker = context.args[0].upper()
     d = analyze(ticker)
-    if not d: await update.message.reply_text("ما لقيت بيانات"); return
+    if not d: await update.message.reply_text("ما لقيت عقد بسعر <= 2.10$ وقريب من السعر، لا تدخل - جرب بعد شوي"); return
     msg, is_call, is_put = format_msg(ticker, d)
     await update.message.reply_text(msg)
     if is_call or is_put:
@@ -198,7 +206,7 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bad:
         await update.message.reply_text(f"⏸️ {bad_reason} - لا تداول الحين")
         return
-    await update.message.reply_text("🔍 أدور لك على أقوى الفرص المستمرة في 34 شركة قيادية...")
+    await update.message.reply_text("🔍 أدور لك على أقوى 5 فرص يومية مستمرة في 34 شركة قيادية...")
     results = []
     for t in BEST_TICKERS:
         try:
@@ -210,10 +218,10 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
     results.sort(reverse=True)
     if not results:
-        await update.message.reply_text("مافي فرص مستمرة قوية الحين، كلها بطيئة وحرقناها 🔥")
+        await update.message.reply_text("مافي فرص يومية مستمرة قوية الحين، كلها بطيئة وحرقناها 🔥")
         return
-    out = "🔥 أقوى 3 فرص مستمرة:\n\n"
-    for i, (sc, t, m) in enumerate(results[:3], 1):
+    out = "🔥 أقوى 5 فرص يومية مستمرة:\n\n"
+    for i, (sc, t, m) in enumerate(results[:5], 1):
         out += f"#{i} {m}\n\n"
     await update.message.reply_text(out.strip())
 
@@ -226,21 +234,12 @@ async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = len(trade_history)
     win_rate = len(wins) / total * 100 if total else 0
     avg_profit = sum(x['profit'] for x in trade_history) / total if total else 0
-    m = f"📊 تقييم البوت:\n\n"
-    m += f"عدد الفرص: {total}\n"
-    m += f"ناجحة: {len(wins)} ✅\n"
-    m += f"فاشلة: {len(losses)} ❌\n"
-    m += f"نسبة النجاح: {win_rate:.0f}%\n"
-    m += f"متوسط الربح: {avg_profit:.0f}%\n\n"
-    m += f"التفاصيل:\n"
+    m = f"📊 تقييم البوت:\n\nعدد الفرص: {total}\nناجحة: {len(wins)} ✅\nفاشلة: {len(losses)} ❌\nنسبة النجاح: {win_rate:.0f}%\nمتوسط الربح: {avg_profit:.0f}%\n\nالتفاصيل:\n"
     for x in trade_history:
         m += f"{x['ticker']} {x['type']} - {x['profit']:.0f}% {'✅' if x['result']=='win' else '❌'}\n"
-    if win_rate >= 60:
-        m += f"\n🎉 البوت ناجح، تقدر تدخل بفلوس حقيقية بحذر"
-    elif win_rate >= 40:
-        m += f"\n⚠️ البوت متوسط، جرب أكثر قبل الفلوس"
-    else:
-        m += f"\n🛑 البوت ضعيف، لا تدخل بفلوس حقيقية"
+    if win_rate >= 60: m += f"\n🎉 البوت ناجح، تقدر تدخل بفلوس حقيقية بحذر"
+    elif win_rate >= 40: m += f"\n⚠️ البوت متوسط، جرب أكثر قبل الفلوس"
+    else: m += f"\n🛑 البوت ضعيف، لا تدخل بفلوس حقيقية"
     await update.message.reply_text(m)
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
