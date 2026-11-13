@@ -1,36 +1,42 @@
-import os, threading, logging, time, json
+import os, threading, logging, time, json, asyncio
 import yfinance as yf
 import pandas as pd
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 TOKEN = os.environ.get("BOT_TOKEN")
 app_web = Flask(__name__)
+
 @app_web.route('/')
 def home(): return "Bot is running"
 
 DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
 
-# === حفظ دائم في ملفات عشان ما يضيع التقييم اذا رندير طفى ===
+# ===== حفظ دائم =====
 def load_json(name, default):
     try:
         if os.path.exists(name):
-            with open(name, 'r') as f: return json.load(f)
-    except: pass
+            with open(name, 'r') as f:
+                data = json.load(f)
+                return data if data is not None else default
+    except Exception as e:
+        print(f"Load {name} error: {e}")
     return default
 
 def save_json(name, data):
     try:
         with open(name, 'w') as f: json.dump(data, f)
-    except: pass
+    except Exception as e:
+        print(f"Save {name} error: {e}")
 
 WATCHLIST = {int(k): v for k, v in load_json("watchlist.json", {}).items()}
 ALERTED = {}
 ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
 HISTORY = load_json("history.json", [])
 
+# ===== مؤشرات =====
 def rsi_calc(data, period=14):
     delta = data.diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
@@ -44,16 +50,17 @@ def get_live_price(ticker):
         if df.empty: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         return float(df['Close'].iloc[-1])
-    except: return None
+    except Exception as e:
+        print(f"Live price {ticker} error: {e}")
+        return None
 
 def get_signal(ticker):
     try:
         df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
-        if df.empty: return None
+        if df.empty or len(df) < 50: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         close = df['Close']
         price = float(close.iloc[-1])
-        # جرب تجيب سعر مباشر
         live = get_live_price(ticker)
         if live: price = live
         prev = float(close.iloc[-2])
@@ -64,6 +71,7 @@ def get_signal(ticker):
         mom15 = float((close.iloc[-1] / close.iloc[-16] - 1) * 100) if len(close) > 16 else 0
         support = float(close.tail(30).min())
         resist = float(close.tail(30).max())
+
         if price > vwap and 45 <= rsi <= 65 and mom15 > 0.5 and price > sma50:
             option = "CALL 📈"; strength = "قوية جدا 🔥"; duration = "15 - 30 دقيقة"
             entry = price; target = price * 1.02; stop = price * 0.99
@@ -99,85 +107,96 @@ def analyze(ticker):
         return f"📊 *{ticker.upper()}*\n💰 السعر: ${sig['price']:.2f} ({sig['change']:+.2f}%)\n🎯 {sig['option']} - {sig['strength']}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
     return f"🚨 *فرصة {sig['strength']}*\n📊 *{ticker.upper()}*\n🎯 {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f}\n🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
 
+# ===== التقييم - أهم دالة =====
+async def check_and_send(bot):
+    global ACTIVE_SIGNALS, HISTORY
+    # نقرأ الملف من جديد كل مرة عشان ما نعتمد على الذاكرة
+    ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
+    HISTORY = load_json("history.json", [])
+    for key in list(ACTIVE_SIGNALS.keys()):
+        try:
+            parts = key.split("_")
+            chat_id = int(parts[0]); sym = parts[1]
+        except: continue
+        old = ACTIVE_SIGNALS.get(key)
+        if not old: continue
+        cur = get_live_price(sym)
+        if not cur:
+            sig_now = get_signal(sym)
+            if not sig_now: continue
+            cur = sig_now['price']
+        result = None; reason_txt = ""
+        if "CALL" in old['option']:
+            if cur >= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
+            elif cur <= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
+        else: # PUT
+            if cur <= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
+            elif cur >= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
+        if result is None and (time.time() - old.get('time', time.time()) > 1800):
+            result = "timeout"
+        if result:
+            if result == "timeout":
+                if "CALL" in old['option']:
+                    result = "win" if cur > old['entry'] else "loss"
+                else:
+                    result = "win" if cur < old['entry'] else "loss"
+                reason_txt = "⏳ خلص وقتها (30 دقيقة)"
+            HISTORY.append({"symbol": sym, "result": result, "option": old['option'], "entry": old['entry'], "exit": cur, "time": old.get('time', time.time())})
+            save_json("history.json", HISTORY)
+            emoji = "✅ نجحت" if result == "win" else "❌ فشلت"
+            try:
+                await bot.send_message(chat_id=chat_id, text=f"{emoji} - فرصة {sym} خلصت\n{reason_txt}\nدخول: ${old['entry']:.2f} | السعر الحالي: ${cur:.2f}\nالحين اقدر ارسل لك فرصة جديدة على {sym} اذا جت 🔥\nشوف تقييمي بـ /stats")
+            except Exception as e: print(f"Send eval error: {e}")
+            if key in ACTIVE_SIGNALS:
+                del ACTIVE_SIGNALS[key]
+            save_json("active.json", ACTIVE_SIGNALS)
+
 async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
+    await check_and_send(context.bot)
     for chat_id, symbols in list(WATCHLIST.items()):
         for sym in symbols:
             active_key = f"{chat_id}_{sym}"
-            if active_key in ACTIVE_SIGNALS:
-                old = ACTIVE_SIGNALS[active_key]
-                cur = get_live_price(sym)
-                if not cur:
-                    sig_now = get_signal(sym)
-                    if not sig_now: continue
-                    cur = sig_now['price']
-                result = None
-                reason_txt = ""
-                if "CALL" in old['option']:
-                    if cur >= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
-                    elif cur <= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
-                else:
-                    if cur <= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
-                    elif cur >= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
-                if result is None and (time.time() - old['time'] > 1800):
-                    result = "timeout"
-                if result:
-                    if result == "timeout":
-                        if "CALL" in old['option']:
-                            result = "win" if cur > old['entry'] else "loss"
-                        else:
-                            result = "win" if cur < old['entry'] else "loss"
-                        reason_txt = "⏳ خلص وقتها (30 دقيقة)"
-                    HISTORY.append({"symbol": sym, "result": result, "option": old['option']})
-                    save_json("history.json", HISTORY)
-                    emoji = "✅ نجحت" if result == "win" else "❌ فشلت"
-                    try:
-                        await context.bot.send_message(chat_id=chat_id, text=f"{emoji} - فرصة {sym} خلصت\n{reason_txt}\nدخول: ${old['entry']:.2f} | السعر الحالي: ${cur:.2f}\nالحين اقدر ارسل لك فرصة جديدة على {sym} اذا جت 🔥\nشوف تقييمي بـ /stats")
-                    except: pass
-                    del ACTIVE_SIGNALS[active_key]
-                    save_json("active.json", ACTIVE_SIGNALS)
-                    continue
-                else:
-                    continue
+            if active_key in ACTIVE_SIGNALS: continue
             sig = get_signal(sym)
             if not sig: continue
-            if sig['strength'] not in ["قوية جدا 🔥", "قوية 💪"]:
-                continue
+            if sig['strength'] not in ["قوية جدا 🔥", "قوية 💪"]: continue
             key = f"{chat_id}_{sym}_{sig['option']}"
             last_price = ALERTED.get(key, 0)
-            if abs(sig['price'] - last_price) < 1:
-                continue
+            if abs(sig['price'] - last_price) < 1: continue
             ALERTED[key] = sig['price']
             ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time()}
             save_json("active.json", ACTIVE_SIGNALS)
             msg = f"🚨 فرصة {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=msg)
-            except Exception as e:
-                print(e)
+            try: await context.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception as e: print(e)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     WATCHLIST[chat_id] = DEFAULT_SYMBOLS.copy()
     save_json("watchlist.json", WATCHLIST)
+    await check_and_send(context.bot)
     await update.message.reply_text("هلا فيك 👋\nسجلتك في التنبيه التلقائي ✅\nبيراقب لك:\nAMZN, NVDA, AAPL, TSLA, MSFT, GOOGL, QQQ, SPY, META, XSP\n\nأي فرصة قوية بتجيك لحالها 🔥\nوتقدر تسأل عن أي سهم بـ /s NVDA\nوتشوف تقييم البوت بـ /stats")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not HISTORY:
+    await check_and_send(context.bot)
+    HISTORY_NOW = load_json("history.json", [])
+    if not HISTORY_NOW:
         await update.message.reply_text("📊 للحين مافيه فرص خلصت عشان اقيمها\nانتظر اول فرصة تخلص وبيجيك التقييم هنا")
         return
-    total = len(HISTORY)
-    wins = len([h for h in HISTORY if h['result'] == "win"])
+    total = len(HISTORY_NOW)
+    wins = len([h for h in HISTORY_NOW if h.get('result') == "win"])
     losses = total - wins
     rate = wins / total * 100 if total else 0
     txt = f"📊 *تقييم البوت لنفسه*\n\n"
     txt += f"إجمالي الفرص: {total}\n✅ نجحت: {wins}\n❌ فشلت: {losses}\n🎯 نسبة النجاح: {rate:.0f}%\n\n"
     for sym in DEFAULT_SYMBOLS:
-        sh = [h for h in HISTORY if h['symbol'] == sym]
+        sh = [h for h in HISTORY_NOW if h.get('symbol') == sym]
         if sh:
-            sw = len([h for h in sh if h['result']=="win"])
+            sw = len([h for h in sh if h.get('result')=="win"])
             txt += f"{sym}: {sw}/{len(sh)} نجحت ({sw/len(sh)*100:.0f}%)\n"
-    if ACTIVE_SIGNALS:
-        txt += f"\n⏳ فرص شغالة الحين: {len(ACTIVE_SIGNALS)}"
+    ACTIVE_NOW = load_json("active.json", {})
+    if ACTIVE_NOW:
+        txt += f"\n⏳ فرص شغالة الحين: {len(ACTIVE_NOW)}"
     await update.message.reply_text(txt, parse_mode="Markdown")
 
 async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,6 +213,12 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = analyze(t)
         if res: await update.message.reply_text(res, parse_mode="Markdown")
 
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global HISTORY, ACTIVE_SIGNALS
+    HISTORY = []; ACTIVE_SIGNALS = {}
+    save_json("history.json", []); save_json("active.json", {})
+    await update.message.reply_text("✅ مسحت كل التقييم والفرص الشغالة، نبدأ من جديد")
+
 def run_bot():
     if not TOKEN:
         print("❌ BOT_TOKEN missing"); return
@@ -203,8 +228,25 @@ def run_bot():
     app_.add_handler(CommandHandler("s", stock))
     app_.add_handler(CommandHandler("watch", watch))
     app_.add_handler(CommandHandler("stats", stats))
+    app_.add_handler(CommandHandler("clear", clear_history))
     if app_.job_queue:
         app_.job_queue.run_repeating(auto_alert, interval=300, first=10)
+        print("✅ job_queue OK")
+    else:
+        print("⚠️ job_queue missing - using threading fallback (هذا هو الحل)")
+        def loop():
+            time.sleep(10)
+            while True:
+                try:
+                    async def run_once():
+                        class FakeContext: pass
+                        ctx = FakeContext(); ctx.bot = app_.bot
+                        await auto_alert(ctx)
+                    asyncio.run(run_once())
+                except Exception as e:
+                    print(f"Loop error: {e}")
+                time.sleep(60)
+        threading.Thread(target=loop, daemon=True).start()
     app_.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
