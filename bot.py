@@ -14,7 +14,6 @@ def home(): return "Bot is running"
 
 DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
 
-# ===== اعدادات العقود - منصة سهم =====
 CONTRACTS = 2
 COMMISSION_PER_CONTRACT = 0.99
 COMMISSION_MIN = 1.99
@@ -26,8 +25,8 @@ MIN_PREMIUM_MOVE = MIN_PROFIT_TOTAL / (CONTRACTS * 100)
 DELTA = 0.35
 MIN_STOCK_MOVE = MIN_PREMIUM_MOVE / DELTA
 REVERSAL_PCT = 0.004
+TIMEOUT_SEC = 3600  # 60 دقيقة بدل 30
 
-# ===== اهداف معقولة لكل الشركات - CALL و PUT نفس المنطق =====
 VOLATILITY = {
     "SPY": (0.005, 0.0035),
     "QQQ": (0.005, 0.0035),
@@ -83,47 +82,62 @@ def get_live_price(ticker):
 
 def get_signal(ticker):
     try:
-        df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
+        # ===== التعديل الجديد: شمعات 5 دقايق لآخر 5 ايام =====
+        df = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
         if df.empty or len(df) < 50: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         close = df['Close']
+        high = df['High']
+        low = df['Low']
+        vol = df['Volume'] if 'Volume' in df.columns else pd.Series([1]*len(df), index=df.index)
         price = float(close.iloc[-1])
         live = get_live_price(ticker)
         if live: price = live
         prev = float(close.iloc[-2])
         change = (price - prev) / prev * 100
-        sma50 = float(close.rolling(50).mean().iloc[-1])
+        # RSI على 5 دقايق - يعكس اللحظة الحالية مو اليوم كامل
         rsi = float(rsi_calc(close).iloc[-1])
-        vwap = float(close.tail(20).mean())
-        mom15 = float((close.iloc[-1] / close.iloc[-16] - 1) * 100) if len(close) > 16 else 0
-        support = float(close.tail(30).min())
-        resist = float(close.tail(30).max())
+        # VWAP حقيقي بالفوليوم
+        typical = (high + low + close) / 3
+        vwap = float((typical * vol).cumsum().iloc[-1] / vol.cumsum().iloc[-1]) if vol.sum() > 0 else float(close.tail(20).mean())
+        # SMA 20 على 5 دقايق = ترند آخر 100 دقيقة
+        sma20 = float(close.rolling(20).mean().iloc[-1])
+        # زخم 15 دقيقة = 3 شمعات 5د، وزخم ساعة = 12 شمعة
+        mom15 = float((close.iloc[-1] / close.iloc[-4] - 1) * 100) if len(close) > 4 else 0
+        mom60 = float((close.iloc[-1] / close.iloc[-13] - 1) * 100) if len(close) > 13 else 0
+        # فوليوم: هل الشمعة الأخيرة أقوى من المتوسط؟
+        avg_vol = float(vol.tail(20).mean())
+        last_vol = float(vol.iloc[-1])
+        vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
+        support = float(close.tail(60).min())
+        resist = float(close.tail(60).max())
         tp, sl = get_tp_sl(ticker)
 
-        if price > vwap and 45 <= rsi <= 65 and mom15 > 0.5 and price > sma50:
-            option = "CALL 📈"; strength = "قوية جدا 🔥"; duration = "15 - 30 دقيقة"
+        # ===== شروط أقوى: لازم زخم + فوليوم + فوق VWAP مع بعض =====
+        if price > vwap and price > sma20 and 50 <= rsi <= 68 and mom15 > 0.25 and mom60 > 0.2 and vol_ratio > 0.8:
+            option = "CALL 📈"; strength = "قوية جدا 🔥"; duration = "30 - 60 دقيقة"
             entry = price; target = price * (1 + tp); stop = price * (1 - sl)
-            reason = "فوق VWAP + RSI متوازن + زخم صاعد"
-        elif price > vwap and 40 <= rsi <= 68 and mom15 > 0:
+            reason = f"فوق VWAP الحقيقي + RSI {rsi:.0f} + زخم 15د {mom15:+.2f}% + فوليوم قوي"
+        elif price > vwap and 45 <= rsi <= 68 and mom15 > 0.15 and mom60 > 0:
             option = "CALL 📈"; strength = "قوية 💪"; duration = "30 - 60 دقيقة"
             entry = price; target = price * (1 + tp * 0.8); stop = price * (1 - sl)
-            reason = "فوق VWAP + زخم صاعد"
-        elif price < vwap and 35 <= rsi <= 55 and mom15 < -0.5 and price < sma50:
-            option = "PUT 📉"; strength = "قوية جدا 🔥"; duration = "15 - 30 دقيقة"
+            reason = f"فوق VWAP + زخم صاعد {mom15:+.2f}%"
+        elif price < vwap and price < sma20 and 32 <= rsi <= 50 and mom15 < -0.25 and mom60 < -0.2 and vol_ratio > 0.8:
+            option = "PUT 📉"; strength = "قوية جدا 🔥"; duration = "30 - 60 دقيقة"
             entry = price; target = price * (1 - tp); stop = price * (1 + sl)
-            reason = "تحت VWAP + RSI نازل + زخم هابط"
-        elif price < vwap and 32 <= rsi <= 60 and mom15 < 0:
+            reason = f"تحت VWAP الحقيقي + RSI {rsi:.0f} + زخم 15د {mom15:+.2f}% + فوليوم قوي"
+        elif price < vwap and 32 <= rsi <= 55 and mom15 < -0.15 and mom60 < 0:
             option = "PUT 📉"; strength = "قوية 💪"; duration = "30 - 60 دقيقة"
             entry = price; target = price * (1 - tp * 0.8); stop = price * (1 + sl)
-            reason = "تحت VWAP + زخم هابط"
-        elif rsi > 70 or rsi < 30:
+            reason = f"تحت VWAP + زخم هابط {mom15:+.2f}%"
+        elif rsi > 72 or rsi < 28:
             option = "انتظار ⚠️"; strength = "متوسطة"; duration = "60 - 120 دقيقة"
-            entry = price; target = resist if rsi < 30 else support; stop = support if rsi < 30 else resist
+            entry = price; target = resist if rsi < 28 else support; stop = support if rsi < 28 else resist
             reason = "متشبع - انتظر ارتداد"
         else:
             option = "انتظار ⚠️"; strength = "ضعيفة"; duration = "لا تدخل"
-            entry = price; target = resist; stop = support; reason = "لا يوجد تأكيد"
-        return {'price': price, 'change': change, 'rsi': rsi, 'vwap': vwap, 'mom15': mom15, 'option': option, 'strength': strength, 'duration': duration, 'entry': entry, 'target': target, 'stop': stop, 'reason': reason, 'support': support, 'resist': resist}
+            entry = price; target = resist; stop = support; reason = f"لا يوجد تأكيد - زخم 15د {mom15:+.2f}% ضعيف"
+        return {'price': price, 'change': change, 'rsi': rsi, 'vwap': vwap, 'mom15': mom15, 'mom60': mom60, 'option': option, 'strength': strength, 'duration': duration, 'entry': entry, 'target': target, 'stop': stop, 'reason': reason, 'support': support, 'resist': resist}
     except Exception as e:
         print(f"Error {ticker}: {e}")
         return None
@@ -132,8 +146,8 @@ def analyze(ticker):
     sig = get_signal(ticker)
     if not sig: return None
     if "انتظار" in sig['option']:
-        return f"📊 *{ticker.upper()}*\n💰 السعر: ${sig['price']:.2f} ({sig['change']:+.2f}%)\n🎯 {sig['option']} - {sig['strength']}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
-    return f"🚨 *فرصة {sig['strength']}*\n📊 *{ticker.upper()}*\n🎯 {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f}\n🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n📉 RSI: {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم: {sig['mom15']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
+        return f"📊 *{ticker.upper()}*\n💰 السعر: ${sig['price']:.2f} ({sig['change']:+.2f}%)\n🎯 {sig['option']} - {sig['strength']}\n⏱️ المدة: {sig['duration']}\n📉 RSI(5د): {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم 15د: {sig['mom15']:+.2f}% | زخم ساعة: {sig['mom60']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
+    return f"🚨 *فرصة {sig['strength']}*\n📊 *{ticker.upper()}*\n🎯 {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f}\n🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n📉 RSI(5د): {sig['rsi']:.0f} | VWAP: ${sig['vwap']:.1f}\n⚡ زخم 15د: {sig['mom15']:+.2f}% | زخم ساعة: {sig['mom60']:+.2f}%\n💡 السبب: {sig['reason']}\n🛡️ دعم: ${sig['support']:.1f} | 🎯 مقاومة: ${sig['resist']:.1f}"
 
 async def check_and_send(bot):
     global ACTIVE_SIGNALS, HISTORY
@@ -175,20 +189,20 @@ async def check_and_send(bot):
         else:
             if cur <= old['target']: result = "win"; reason_txt = "🎯 وصلت الهدف"
             elif cur >= old['stop']: result = "loss"; reason_txt = "🛑 ضربت الستوب"
-        if result is None and (time.time() - old.get('time', time.time()) > 1800):
+        if result is None and (time.time() - old.get('time', time.time()) > TIMEOUT_SEC):
             result = "timeout"
         if result:
             if result == "timeout":
                 if is_call:
                     if move >= MIN_STOCK_MOVE:
-                        result = "win"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
+                        result = "win"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
                     else:
-                        result = "loss"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
+                        result = "loss"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
                 else:
                     if move <= -MIN_STOCK_MOVE:
-                        result = "win"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
+                        result = "win"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ ✅ غطى عمولة {CONTRACTS} عقود"
                     else:
-                        result = "loss"; reason_txt = f"⏳ خلص وقتها (30 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
+                        result = "loss"; reason_txt = f"⏳ خلص وقتها (60 دقيقة) - تحرك {move:+.2f}$ فقط ❌ ما غطى عمولة {CONTRACTS} عقود (لازم {MIN_STOCK_MOVE:.2f}$)"
             HISTORY.append({"symbol": sym, "result": result, "option": old['option'], "entry": entry, "exit": cur, "move": move, "time": old.get('time', time.time())})
             save_json("history.json", HISTORY)
             emoji = "✅ نجحت" if result == "win" else "❌ فشلت"
@@ -208,8 +222,6 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
             sig = get_signal(sym)
             if not sig: continue
             if sig['strength'] not in ["قوية جدا 🔥", "قوية 💪"]: continue
-            # تم الغاء شرط الـ 1$ - كان يمنع ارسال الفرص الجديدة
-            # الحين اذا مافيه فرصة شغالة على نفس السهم، يرسل على طول
             ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time(), "reversed_alerted": False}
             save_json("active.json", ACTIVE_SIGNALS)
             msg = f"🚨 فرصة عقود {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول السهم: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n📊 للعقود ({CONTRACTS} عقود): لازم السهم يتحرك {MIN_STOCK_MOVE:.2f}$ عشان تغطي عمولة سهم + ربح\n⚠️ اذا انعكس عليك 0.4% بجيك تنبيه انعكاس\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
