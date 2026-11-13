@@ -5,7 +5,6 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 
-# سيرفر وهمي عشان Render ما يطفي البوت
 def keep_alive():
     port = int(os.environ.get("PORT", 10000))
     class H(BaseHTTPRequestHandler):
@@ -13,11 +12,13 @@ def keep_alive():
             self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
         def log_message(self, *a): pass
     HTTPServer(("0.0.0.0", port), H).serve_forever()
-
 threading.Thread(target=keep_alive, daemon=True).start()
 
 MAX_CONTRACT_PRICE = 2.10
-MAX_CONTRACTS = 1
+COMMISSION = 4.58
+SUCCESS_MOVE = 0.20
+REVERSAL_PCT = 0.40
+active_trades = {}
 
 def get_expiry():
     today = datetime.date.today()
@@ -34,11 +35,11 @@ def get_earnings(ticker):
             if isinstance(ed, list): ed = ed[0]
             days = (ed.date() - datetime.date.today()).days if hasattr(ed, 'date') else 99
             if 0 <= days <= 3:
-                return f"⚠️ أرباح بعد {days} يوم - انتبه"
-            return "✅ مافي أرباح قريبة (2-3 أيام)"
-        return "✅ مافي أرباح قريبة (2-3 أيام)"
+                return f"⚠️ أرباح بعد {days} يوم"
+            return "✅ مافي أرباح"
+        return "✅ مافي أرباح"
     except:
-        return "✅ مافي أرباح قريبة (2-3 أيام)"
+        return "✅ مافي أرباح"
 
 def analyze(ticker):
     tk = yf.Ticker(ticker)
@@ -58,9 +59,11 @@ def analyze(ticker):
     liq = vol / vol_avg if vol_avg else 0
     sup_n = float(daily['Low'].tail(2).min()); res_n = float(daily['High'].tail(2).max())
     sup_f = float(daily['Low'].min()); res_f = float(daily['High'].max())
-    expiry_str = get_expiry().strftime("%Y-%m-%d")
-    contract_price, strike, iv, delta_g, theta = 1.85, round(price + 2.5), 38, 0.42, -0.18
+    expiry = get_expiry()
+    expiry_str = expiry.strftime("%Y-%m-%d")
     is_call_guess = mom15 >= 0
+    strike = round(price + 2.5) if is_call_guess else round(price - 2.5)
+    contract_price, iv, delta_g, theta = 1.85, 38, 0.42, -0.18
     try:
         opt = tk.option_chain(expiry_str)
         chain = opt.calls if is_call_guess else opt.puts
@@ -75,30 +78,53 @@ def analyze(ticker):
     return {"price":price,"rsi":rsi,"vwap":vwap,"mom15":mom15,"mom1h":mom1h,"trend":trend3,"liq":liq,
             "sup_n":sup_n,"sup_f":sup_f,"res_n":res_n,"res_f":res_f,
             "strike":strike,"cprice":contract_price,"iv":iv,"delta":delta_g,"theta":theta,
-            "expiry":get_expiry(),"earn":get_earnings(ticker)}
+            "expiry":expiry,"earn":get_earnings(ticker),"is_call_guess":is_call_guess}
 
 def format_msg(ticker, d):
-    breakeven = d['strike'] + d['cprice'] if d['mom15'] >= 0 else d['strike'] - d['cprice']
-    stop = d['cprice'] * 0.70; t1 = d['cprice'] * 1.50; t2 = d['cprice'] * 2.0
-    total = d['cprice'] * 100 * MAX_CONTRACTS
+    breakeven = d['strike'] + d['cprice'] + (COMMISSION/100) if d['is_call_guess'] else d['strike'] - d['cprice'] - (COMMISSION/100)
+    stop = d['cprice'] * 0.70
+    t1 = d['cprice'] * 1.50
+    t2 = d['cprice'] * 2.0
+    total = d['cprice'] * 100 + COMMISSION
+    success_price = d['cprice'] + SUCCESS_MOVE
     is_call = d['mom15'] >= 0.50 and d['liq'] >= 1.2 and d['trend'] > 0
     is_put = d['mom15'] <= -0.50 and d['liq'] >= 1.2 and d['trend'] < 0
-    if d['cprice'] > MAX_CONTRACT_PRICE:
-        dec = "تخطي - عقد غالي"; typ = "انتظار"
-    elif is_call: dec = "CALL قوي - ادخل"; typ = "CALL"
-    elif is_put: dec = "PUT قوي - ادخل"; typ = "PUT"
-    else: dec = "انتظار ⚠️ - ضعيفة"; typ = "انتظار"
-    theta_warn = "ثيتا عالي - لا تنام فيه" if d['theta'] < -0.25 else "ثيتا مريح"
-    m = f"📊 {ticker} | ${d['price']:.2f} ({d['mom15']:+.2f}%)\n"
-    m += f"🎯 {dec} | ⏱️ {d['expiry'].strftime('%d %b')}\n"
-    m += f"📉 RSI: {d['rsi']:.0f} | VWAP: ${d['vwap']:.1f} | زخم ساعة: {d['mom1h']:+.2f}% | اتجاه 3أ: {d['trend']:+.2f}% | سيولة: {d['liq']:.1f}x\n"
-    m += f"💰 سترايك: {d['strike']:.0f}$ | عقد: {d['cprice']:.2f}$ | إجمالي 1 عقد: {total:.0f}$ | تعادل: {breakeven:.2f}$\n"
-    m += f"📈 دلتا: {d['delta']:.2f} | ثيتا: {d['theta']:.2f} | IV: {d['iv']:.0f}% | {theta_warn}\n"
-    m += f"🛡️ دعم: {d['sup_n']:.1f}$ / {d['sup_f']:.1f}$ | 🎯 مقاومة: {d['res_n']:.1f}$ / {d['res_f']:.1f}$\n"
-    m += f"🛑 وقف: -30% ({stop:.2f}$) | 🎯 هدف: +50% ({t1:.2f}$) / +100% ({t2:.2f}$)\n"
-    m += f"💡 السبب: زخم {d['mom15']:+.2f}% / سيولة {d['liq']:.1f}x / اتجاه {d['trend']:+.2f}%\n"
-    m += f"{d['earn']}"
-    return m
+    if d['cprice'] > MAX_CONTRACT_PRICE: dec = "تخطي - غالي"
+    elif is_call: dec = "CALL - ادخل"
+    elif is_put: dec = "PUT - ادخل"
+    else: dec = "انتظار ⚠️"
+    theta_warn = "ثيتا عالي!" if d['theta'] < -0.25 else "ثيتا مريح"
+    # 6 أسطر فقط - مختصر
+    m = f"📊 {ticker} ${d['price']:.2f} ({d['mom15']:+.2f}%) | 🎯 {dec} | ⏱️ {d['expiry'].strftime('%d %b')}\n"
+    m += f"📉 RSI {d['rsi']:.0f} | VWAP ${d['vwap']:.1f} | زخم {d['mom1h']:+.2f}% | اتجاه {d['trend']:+.2f}% | سيولة {d['liq']:.1f}x | دلتا {d['delta']:.2f} | ثيتا {d['theta']:.2f} | IV {d['iv']:.0f}%\n"
+    m += f"💰 سترايك {d['strike']:.0f}$ | عقد {d['cprice']:.2f}$ | إجمالي 1 عقد {total:.0f}$ شامل عمولة | تعادل {breakeven:.2f}$\n"
+    m += f"🛡️ دعم {d['sup_n']:.1f}$ / {d['sup_f']:.1f}$ | 🎯 مقاومة {d['res_n']:.1f}$ / {d['res_f']:.1f}$\n"
+    m += f"🛑 وقف {stop:.2f}$ (-30%) | 🎯 هدف1 {t1:.2f}$ (+50%) | 🎯 هدف2 {t2:.2f}$ (+100%) | ✅ نجاح {success_price:.2f}$ (+0.20$)\n"
+    m += f"{d['earn']} | {theta_warn} | انعكاس 0.4% | 🔔 تنبيه عند الهدف والوقف"
+    return m, is_call, is_put
+
+async def check_targets(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id, tr in list(active_trades.items()):
+        try:
+            tk = yf.Ticker(tr['ticker'])
+            expiry_str = tr['expiry'].strftime("%Y-%m-%d")
+            opt = tk.option_chain(expiry_str)
+            chain = opt.calls if tr['type'] == 'CALL' else opt.puts
+            row = chain[chain['strike'] == tr['strike']]
+            if row.empty: continue
+            cur = float(row.iloc[0]['lastPrice'])
+            if not tr.get('t1_hit') and cur >= tr['t1']:
+                tr['t1_hit'] = True
+                await context.bot.send_message(chat_id, f"🎯 {tr['ticker']} وصل الهدف الأول +50% ({cur:.2f}$) - حرك وقفك على الدخول")
+            if not tr.get('t2_hit') and cur >= tr['t2']:
+                tr['t2_hit'] = True
+                await context.bot.send_message(chat_id, f"🎯🎯 {tr['ticker']} وصل الهدف الثاني +100% ({cur:.2f}$) - بيع العقد كامل 🎉")
+                del active_trades[chat_id]
+                continue
+            if cur <= tr['stop']:
+                await context.bot.send_message(chat_id, f"🛑 {tr['ticker']} وصل الوقف -30% ({cur:.2f}$) - اطلع فورا")
+                del active_trades[chat_id]
+        except: pass
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -106,12 +132,22 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ticker = context.args[0].upper()
     d = analyze(ticker)
     if not d: await update.message.reply_text("ما لقيت بيانات"); return
-    await update.message.reply_text(format_msg(ticker, d))
+    msg, is_call, is_put = format_msg(ticker, d)
+    await update.message.reply_text(msg)
+    if is_call or is_put:
+        active_trades[update.effective_chat.id] = {
+            'ticker': ticker, 'strike': d['strike'], 'entry': d['cprice'],
+            't1': d['cprice']*1.5, 't2': d['cprice']*2.0, 'stop': d['cprice']*0.70,
+            'type': 'CALL' if is_call else 'PUT', 'expiry': d['expiry'],
+            't1_hit': False, 't2_hit': False
+        }
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("مسحت كل التقييم والفرص الشغالة، نبدأ من جديد ✅")
+    active_trades.pop(update.effective_chat.id, None)
+    await update.message.reply_text("مسحت كل شي، نبدأ من جديد ✅")
 
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("s", s_cmd))
 app.add_handler(CommandHandler("clear", clear_cmd))
+app.job_queue.run_repeating(check_targets, interval=60, first=10)
 app.run_polling()
