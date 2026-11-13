@@ -2,6 +2,7 @@ import os, yfinance as yf, datetime, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from zoneinfo import ZoneInfo
 
 TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 
@@ -19,12 +20,46 @@ COMMISSION = 4.58
 SUCCESS_MOVE = 0.20
 REVERSAL_PCT = 0.40
 active_trades = {}
+BEST_TICKERS = ["NVDA","TSLA","AAPL","MSFT","AMZN","META","AMD","NFLX","GOOGL","AVGO","PLTR","COIN",
+                "JPM","V","MA","BAC","GS","UNH","JNJ","LLY","ABBV","WMT","COST","HD","PG","DIS",
+                "XOM","CAT","ORCL","CRM","ADBE","SPY","QQQ"]
 
 def get_expiry():
     today = datetime.date.today()
     days_ahead = (4 - today.weekday()) % 7
     if days_ahead == 0: days_ahead = 7
     return today + datetime.timedelta(days=days_ahead)
+
+def get_market_trend():
+    # اتجاه السوق العام SPY
+    try:
+        spy = yf.Ticker("SPY").history(period="5d", interval="15m")
+        if spy.empty: return 0, 0
+        mom = (spy['Close'].iloc[-1] / spy['Close'].iloc[-4] - 1) * 100 if len(spy) > 4 else 0
+        daily = yf.Ticker("SPY").history(period="5d", interval="1d")
+        trend = (daily['Close'].iloc[-1] / daily['Close'].iloc[-4] - 1) * 100 if len(daily) >= 4 else 0
+        return mom, trend
+    except:
+        return 0, 0
+
+def is_bad_time():
+    # وقت السوق بتوقيت نيويورك
+    try:
+        now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
+        # ويكند
+        if now_et.weekday() >= 5: return True, "السوق مسكر - ويكند"
+        mins = now_et.hour * 60 + now_et.minute
+        # قبل الافتتاح وبعده
+        if mins < 575 or mins >= 960: return True, "السوق مسكر"
+        # أول 5 دقايق 9:30 - 9:35
+        if 570 <= mins < 575: return True, "أول 5 دقايق - كذب"
+        # وقت الغداء 12:00 - 13:00
+        if 720 <= mins < 780: return True, "وقت غداء - بطيء"
+        # آخر نص ساعة 15:30 - 16:00
+        if mins >= 930: return True, "آخر نص ساعة - خطير"
+        return False, ""
+    except:
+        return False, ""
 
 def get_earnings(ticker):
     try:
@@ -75,32 +110,55 @@ def analyze(ticker):
             delta_g = 0.42 if abs(strike - price) < 3 else 0.30
             theta = -0.18 if abs(strike - price) < 3 else -0.12
     except: pass
+    cont_short_up = mom15 >= 0.50 and mom1h >= 0 and trend3 > 0
+    cont_short_down = mom15 <= -0.50 and mom1h <= 0 and trend3 < 0
+    cont_long_up = abs(trend3) >= 2 and trend3 > 0 and mom15 >= 0 and mom1h >= 0
+    cont_long_down = abs(trend3) >= 2 and trend3 < 0 and mom15 <= 0 and mom1h <= 0
+    if cont_short_up or cont_short_down:
+        duration = "15 - 30 دقيقة"
+        cont_type = "short"
+    elif cont_long_up or cont_long_down:
+        duration = "يومين - 3 أيام"
+        cont_type = "long"
+    else:
+        duration = "15 - 30 دقيقة"
+        cont_type = "none"
+    spy_mom, spy_trend = get_market_trend()
+    score = abs(mom15)*3 + abs(trend3)*2 + min(liq,5)*2
+    if cont_type != "none": score += 10
+    if 45 <= rsi <= 75: score += 5
+    # بونص اذا مع السوق
+    if (mom15 > 0 and spy_mom >= 0) or (mom15 < 0 and spy_mom <= 0): score += 5
+    # بونص اذا مع VWAP
+    if (mom15 > 0 and price > vwap) or (mom15 < 0 and price < vwap): score += 5
     return {"price":price,"rsi":rsi,"vwap":vwap,"mom15":mom15,"mom1h":mom1h,"trend":trend3,"liq":liq,
             "sup_n":sup_n,"sup_f":sup_f,"res_n":res_n,"res_f":res_f,
             "strike":strike,"cprice":contract_price,"iv":iv,"delta":delta_g,"theta":theta,
-            "expiry":expiry,"earn":get_earnings(ticker),"is_call_guess":is_call_guess}
+            "expiry":expiry,"earn":get_earnings(ticker),"is_call_guess":is_call_guess,"duration":duration,"cont_type":cont_type,"score":score,
+            "spy_mom":spy_mom,"spy_trend":spy_trend}
 
 def format_msg(ticker, d):
-    breakeven = d['strike'] + d['cprice'] + (COMMISSION/100) if d['is_call_guess'] else d['strike'] - d['cprice'] - (COMMISSION/100)
     stop = d['cprice'] * 0.70
     t1 = d['cprice'] * 1.50
     t2 = d['cprice'] * 2.0
-    total = d['cprice'] * 100 + COMMISSION
-    success_price = d['cprice'] + SUCCESS_MOVE
-    is_call = d['mom15'] >= 0.50 and d['liq'] >= 1.2 and d['trend'] > 0
-    is_put = d['mom15'] <= -0.50 and d['liq'] >= 1.2 and d['trend'] < 0
-    if d['cprice'] > MAX_CONTRACT_PRICE: dec = "تخطي - غالي"
-    elif is_call: dec = "CALL - ادخل"
-    elif is_put: dec = "PUT - ادخل"
+    # فلتر الوقت
+    bad, bad_reason = is_bad_time()
+    # CALL: مستمرة + فوق VWAP + السوق صاعد
+    is_call = d['cont_type'] in ("short","long") and d['mom15'] >= 0 and d['trend'] > 0 and d['liq'] >= 1.2 and d['price'] > d['vwap'] and d['spy_mom'] >= 0 and not bad
+    # PUT: مستمرة + تحت VWAP + السوق هابط
+    is_put = d['cont_type'] in ("short","long") and d['mom15'] <= 0 and d['trend'] < 0 and d['liq'] >= 1.2 and d['price'] < d['vwap'] and d['spy_mom'] <= 0 and not bad
+    if d['cprice'] > MAX_CONTRACT_PRICE: dec = "تخطي"
+    elif is_call: dec = "CALL"
+    elif is_put: dec = "PUT"
     else: dec = "انتظار ⚠️"
-    theta_warn = "ثيتا عالي!" if d['theta'] < -0.25 else "ثيتا مريح"
-    # 6 أسطر فقط - مختصر
-    m = f"📊 {ticker} ${d['price']:.2f} ({d['mom15']:+.2f}%) | 🎯 {dec} | ⏱️ {d['expiry'].strftime('%d %b')}\n"
-    m += f"📉 RSI {d['rsi']:.0f} | VWAP ${d['vwap']:.1f} | زخم {d['mom1h']:+.2f}% | اتجاه {d['trend']:+.2f}% | سيولة {d['liq']:.1f}x | دلتا {d['delta']:.2f} | ثيتا {d['theta']:.2f} | IV {d['iv']:.0f}%\n"
-    m += f"💰 سترايك {d['strike']:.0f}$ | عقد {d['cprice']:.2f}$ | إجمالي 1 عقد {total:.0f}$ شامل عمولة | تعادل {breakeven:.2f}$\n"
-    m += f"🛡️ دعم {d['sup_n']:.1f}$ / {d['sup_f']:.1f}$ | 🎯 مقاومة {d['res_n']:.1f}$ / {d['res_f']:.1f}$\n"
-    m += f"🛑 وقف {stop:.2f}$ (-30%) | 🎯 هدف1 {t1:.2f}$ (+50%) | 🎯 هدف2 {t2:.2f}$ (+100%) | ✅ نجاح {success_price:.2f}$ (+0.20$)\n"
-    m += f"{d['earn']} | {theta_warn} | انعكاس 0.4% | 🔔 تنبيه عند الهدف والوقف"
+    m = f"📊 {ticker}\n"
+    m += f"سترايك {d['strike']:.0f}$ - {dec}\n"
+    m += f"السعر {d['cprice']:.2f}$\n"
+    m += f"التاريخ {d['expiry'].strftime('%d %b')} - المدة {d['duration']}\n"
+    m += f"الدعم {d['sup_n']:.1f}$ | المقاومة {d['res_n']:.1f}$\n"
+    m += f"الوقف {stop:.2f}$\n"
+    m += f"الهدف الأول {t1:.2f}$\n"
+    m += f"الهدف الثاني {t2:.2f}$"
     return m, is_call, is_put
 
 async def check_targets(context: ContextTypes.DEFAULT_TYPE):
@@ -142,12 +200,37 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             't1_hit': False, 't2_hit': False
         }
 
+async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bad, bad_reason = is_bad_time()
+    if bad:
+        await update.message.reply_text(f"⏸️ {bad_reason} - لا تداول الحين")
+        return
+    await update.message.reply_text("🔍 أدور لك على أقوى الفرص المستمرة في 34 شركة قيادية...")
+    results = []
+    for t in BEST_TICKERS:
+        try:
+            d = analyze(t)
+            if not d: continue
+            msg, is_call, is_put = format_msg(t, d)
+            if is_call or is_put:
+                results.append((d['score'], t, msg))
+        except: pass
+    results.sort(reverse=True)
+    if not results:
+        await update.message.reply_text("مافي فرص مستمرة قوية الحين، كلها بطيئة وحرقناها 🔥")
+        return
+    out = "🔥 أقوى 3 فرص مستمرة:\n\n"
+    for i, (sc, t, m) in enumerate(results[:3], 1):
+        out += f"#{i} {m}\n\n"
+    await update.message.reply_text(out.strip())
+
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_trades.pop(update.effective_chat.id, None)
     await update.message.reply_text("مسحت كل شي، نبدأ من جديد ✅")
 
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("s", s_cmd))
+app.add_handler(CommandHandler("best", best_cmd))
 app.add_handler(CommandHandler("clear", clear_cmd))
 app.job_queue.run_repeating(check_targets, interval=60, first=10)
 app.run_polling()
