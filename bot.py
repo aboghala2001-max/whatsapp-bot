@@ -1,4 +1,4 @@
-import os, threading, logging, time
+import os, threading, logging, time, json
 import yfinance as yf
 import pandas as pd
 from flask import Flask
@@ -12,10 +12,24 @@ app_web = Flask(__name__)
 def home(): return "Bot is running"
 
 DEFAULT_SYMBOLS = ["AMZN","NVDA","AAPL","TSLA","MSFT","GOOGL","QQQ","SPY","META","XSP"]
-WATCHLIST = {}
+
+# === حفظ دائم في ملفات عشان ما يضيع التقييم اذا رندير طفى ===
+def load_json(name, default):
+    try:
+        if os.path.exists(name):
+            with open(name, 'r') as f: return json.load(f)
+    except: pass
+    return default
+
+def save_json(name, data):
+    try:
+        with open(name, 'w') as f: json.dump(data, f)
+    except: pass
+
+WATCHLIST = {int(k): v for k, v in load_json("watchlist.json", {}).items()}
 ALERTED = {}
-ACTIVE_SIGNALS = {}
-HISTORY = []
+ACTIVE_SIGNALS = {k: v for k, v in load_json("active.json", {}).items()}
+HISTORY = load_json("history.json", [])
 
 def rsi_calc(data, period=14):
     delta = data.diff()
@@ -24,6 +38,14 @@ def rsi_calc(data, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+def get_live_price(ticker):
+    try:
+        df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=True)
+        if df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        return float(df['Close'].iloc[-1])
+    except: return None
+
 def get_signal(ticker):
     try:
         df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
@@ -31,6 +53,9 @@ def get_signal(ticker):
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         close = df['Close']
         price = float(close.iloc[-1])
+        # جرب تجيب سعر مباشر
+        live = get_live_price(ticker)
+        if live: price = live
         prev = float(close.iloc[-2])
         change = (price - prev) / prev * 100
         sma50 = float(close.rolling(50).mean().iloc[-1])
@@ -80,9 +105,11 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
             active_key = f"{chat_id}_{sym}"
             if active_key in ACTIVE_SIGNALS:
                 old = ACTIVE_SIGNALS[active_key]
-                sig_now = get_signal(sym)
-                if not sig_now: continue
-                cur = sig_now['price']
+                cur = get_live_price(sym)
+                if not cur:
+                    sig_now = get_signal(sym)
+                    if not sig_now: continue
+                    cur = sig_now['price']
                 result = None
                 reason_txt = ""
                 if "CALL" in old['option']:
@@ -101,11 +128,13 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
                             result = "win" if cur < old['entry'] else "loss"
                         reason_txt = "⏳ خلص وقتها (30 دقيقة)"
                     HISTORY.append({"symbol": sym, "result": result, "option": old['option']})
+                    save_json("history.json", HISTORY)
                     emoji = "✅ نجحت" if result == "win" else "❌ فشلت"
                     try:
                         await context.bot.send_message(chat_id=chat_id, text=f"{emoji} - فرصة {sym} خلصت\n{reason_txt}\nدخول: ${old['entry']:.2f} | السعر الحالي: ${cur:.2f}\nالحين اقدر ارسل لك فرصة جديدة على {sym} اذا جت 🔥\nشوف تقييمي بـ /stats")
                     except: pass
                     del ACTIVE_SIGNALS[active_key]
+                    save_json("active.json", ACTIVE_SIGNALS)
                     continue
                 else:
                     continue
@@ -119,6 +148,7 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
                 continue
             ALERTED[key] = sig['price']
             ACTIVE_SIGNALS[active_key] = {"entry": sig['entry'], "target": sig['target'], "stop": sig['stop'], "option": sig['option'], "time": time.time()}
+            save_json("active.json", ACTIVE_SIGNALS)
             msg = f"🚨 فرصة {sig['strength']}\n{sym} - {sig['option']}\n💰 دخول: ${sig['entry']:.2f}\n🎯 هدف: ${sig['target']:.2f} | 🛑 وقف: ${sig['stop']:.2f}\n⏱️ المدة: {sig['duration']}\n💡 {sig['reason']}\n\n⏳ هذي الفرصة شغالة، ما بجيك فرصة ثانية على {sym} الا لما تخلص"
             try:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
@@ -128,6 +158,7 @@ async def auto_alert(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     WATCHLIST[chat_id] = DEFAULT_SYMBOLS.copy()
+    save_json("watchlist.json", WATCHLIST)
     await update.message.reply_text("هلا فيك 👋\nسجلتك في التنبيه التلقائي ✅\nبيراقب لك:\nAMZN, NVDA, AAPL, TSLA, MSFT, GOOGL, QQQ, SPY, META, XSP\n\nأي فرصة قوية بتجيك لحالها 🔥\nوتقدر تسأل عن أي سهم بـ /s NVDA\nوتشوف تقييم البوت بـ /stats")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
