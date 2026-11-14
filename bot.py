@@ -16,7 +16,7 @@ def keep_alive():
 threading.Thread(target=keep_alive, daemon=True).start()
 
 MAX_CONTRACT_PRICE = 2.50
-MIN_CONTRACT_PRICE = 0.80
+MIN_CONTRACT_PRICE = 0.50
 active_trades = {}
 trade_history = []
 BEST_TICKERS = ["NVDA","TSLA","AAPL","MSFT","AMZN","META","AMD","NFLX","GOOGL","AVGO","PLTR","COIN",
@@ -110,7 +110,12 @@ def analyze(ticker):
     try:
         opt = tk.option_chain(expiry_str)
         chain = opt.calls if is_call_guess else opt.puts
-        chain = chain[abs(chain['strike'] - price) <= 10]
+        # التعديل الجديد: لو بعيد عادي، نبحث لحد 8% من سعر السهم
+        # META 650$ -> نبحث لحد 52$ بعيد
+        # TSLA 390$ -> نبحث لحد 40$ بعيد
+        # أهم شي السعر 0.50 - 2.50 وكل الشروط مستوفية
+        max_dist = max(40, price * 0.08)
+        chain = chain[abs(chain['strike'] - price) <= max_dist]
         valid = chain[(chain['lastPrice'] <= MAX_CONTRACT_PRICE) & (chain['lastPrice'] >= MIN_CONTRACT_PRICE)]
         if not valid.empty:
             valid = valid.copy()
@@ -188,7 +193,7 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اكتب: /s NVDA"); return
     ticker = context.args[0].upper()
     d = analyze(ticker)
-    if not d: await update.message.reply_text("ما لقيت عقد بسعر 0.80$ - 2.50$ وقريب من السعر، لا تدخل - جرب بعد شوي"); return
+    if not d: await update.message.reply_text("ما لقيت عقد بسعر 0.50$ - 2.50$ وقريب من السعر، لا تدخل - جرب بعد شوي"); return
     msg, is_call, is_put = format_msg(ticker, d)
     await update.message.reply_text(msg)
     if is_call or is_put:
