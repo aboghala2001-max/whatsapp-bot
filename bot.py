@@ -15,7 +15,8 @@ def keep_alive():
     HTTPServer(("0.0.0.0", port), H).serve_forever()
 threading.Thread(target=keep_alive, daemon=True).start()
 
-MAX_CONTRACT_PRICE = 2.10
+MAX_CONTRACT_PRICE = 2.50
+MIN_CONTRACT_PRICE = 0.80
 active_trades = {}
 trade_history = []
 BEST_TICKERS = ["NVDA","TSLA","AAPL","MSFT","AMZN","META","AMD","NFLX","GOOGL","AVGO","PLTR","COIN",
@@ -23,13 +24,15 @@ BEST_TICKERS = ["NVDA","TSLA","AAPL","MSFT","AMZN","META","AMD","NFLX","GOOGL","
                 "XOM","CAT","ORCL","CRM","ADBE","SPY","QQQ"]
 
 def get_expiry_daily():
-    # كل الفرص يومية - نفس يوم التداول فقط
-    today = datetime.date.today()
-    # اذا اليوم سبت 14 -> الاثنين 16، اذا أحد -> الاثنين 16، غيره نفس اليوم
-    entry = today
-    while entry.weekday() >= 5:
-        entry += datetime.timedelta(days=1)
-    return entry
+    now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
+    today = now_et.date()
+    mins = now_et.hour * 60 + now_et.minute
+    if today.weekday() >= 5 or mins >= 960:
+        nxt = today + datetime.timedelta(days=1)
+        while nxt.weekday() >= 5:
+            nxt += datetime.timedelta(days=1)
+        return nxt
+    return today
 
 def get_market_trend():
     try:
@@ -92,16 +95,12 @@ def analyze(ticker):
     trend3 = (daily['Close'].iloc[-1] / daily['Close'].iloc[-4] - 1) * 100 if len(daily) >= 4 else 0
     vol = float(hist['Volume'].iloc[-1]); vol_avg = float(hist['Volume'].mean())
     liq = vol / vol_avg if vol_avg else 0
-
-    # فقط فرص يومية - ألغينا يومين و 3 أيام
     duration = "15 - 30 دقيقة"
     cont_type = "short"
-    # إذا ما فيه استمرارية قصيرة، نعتبرها انتظار، ولا نعطي فرصة طويلة
     cont_short_up = mom15 >= 0.50 and mom1h >= 0 and trend3 > 0
     cont_short_down = mom15 <= -0.50 and mom1h <= 0 and trend3 < 0
     if not (cont_short_up or cont_short_down):
         cont_type = "none"
-
     expiry = get_expiry_daily()
     expiry_str = expiry.strftime("%Y-%m-%d")
     is_call_guess = mom15 >= 0
@@ -112,7 +111,7 @@ def analyze(ticker):
         opt = tk.option_chain(expiry_str)
         chain = opt.calls if is_call_guess else opt.puts
         chain = chain[abs(chain['strike'] - price) <= 10]
-        valid = chain[(chain['lastPrice'] <= MAX_CONTRACT_PRICE) & (chain['lastPrice'] > 0.30)]
+        valid = chain[(chain['lastPrice'] <= MAX_CONTRACT_PRICE) & (chain['lastPrice'] >= MIN_CONTRACT_PRICE)]
         if not valid.empty:
             valid = valid.copy()
             valid['dist'] = abs(valid['strike'] - price)
@@ -141,7 +140,6 @@ def format_msg(ticker, d):
     t1 = d['cprice'] * 1.50
     t2 = d['cprice'] * 2.0
     bad, bad_reason = is_bad_time()
-    # كل الشروط لازم تتوفر، ولا ما يعطي CALL ولا PUT
     is_call = d['cont_type'] == "short" and d['mom15'] >= 0 and d['trend'] > 0 and d['liq'] >= 1.2 and d['price'] > d['vwap'] and d['spy_mom'] >= 0 and not bad
     is_put = d['cont_type'] == "short" and d['mom15'] <= 0 and d['trend'] < 0 and d['liq'] >= 1.2 and d['price'] < d['vwap'] and d['spy_mom'] <= 0 and not bad
     if d['cprice'] > MAX_CONTRACT_PRICE: dec = "تخطي"
@@ -150,7 +148,7 @@ def format_msg(ticker, d):
     else: dec = "انتظار ⚠️"
     m = f"📊 {ticker}\n"
     m += f"سعر السهم {d['price']:.1f}$ | سترايك {d['strike']:.0f}$ - {dec}\n"
-    m += f"السعر {d['cprice']:.2f}$ - ماكس 2.10$\n"
+    m += f"السعر {d['cprice']:.2f}$ - ماكس 2.50$\n"
     m += f"التاريخ {d['expiry'].strftime('%d %b')} - المدة {d['duration']}\n"
     m += f"الدعم {d['sup_n']:.1f}$ | المقاومة {d['res_n']:.1f}$\n"
     m += f"الوقف {stop:.2f}$\n"
@@ -190,7 +188,7 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اكتب: /s NVDA"); return
     ticker = context.args[0].upper()
     d = analyze(ticker)
-    if not d: await update.message.reply_text("ما لقيت عقد بسعر <= 2.10$ وقريب من السعر، لا تدخل - جرب بعد شوي"); return
+    if not d: await update.message.reply_text("ما لقيت عقد بسعر 0.80$ - 2.50$ وقريب من السعر، لا تدخل - جرب بعد شوي"); return
     msg, is_call, is_put = format_msg(ticker, d)
     await update.message.reply_text(msg)
     if is_call or is_put:
