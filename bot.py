@@ -1,20 +1,17 @@
-import os, datetime, pytz, threading
-print("=== BOT START ===", flush=True)
-TOKEN = os.getenv("BOT_TOKEN")
-print("TOKEN EXISTS:", bool(TOKEN), "LEN:", len(TOKEN) if TOKEN else 0, flush=True)
-
-import telebot, yfinance as yf
+import os, datetime, pytz, threading, asyncio
 from flask import Flask
+import yfinance as yf
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+TOKEN = os.getenv("BOT_TOKEN")
+print("TOKEN EXISTS:", bool(TOKEN), flush=True)
+
 app = Flask(__name__)
 @app.route('/')
 def home(): return "Bot is running"
 
-bot = telebot.TeleBot(TOKEN)
-print("TELEBOT OK", flush=True)
-
 TICKERS = ["NVDA","TSLA","META","AAPL","AMD","PLTR","COIN","MSFT","AMZN","GOOGL","NFLX","AVGO","MU","SMCI","ARM","SHOP","SQ","PYPL","UBER","ABNB","CRWD","PANW","MRVL","INTC","QCOM","TXN","ADBE","ORCL","CRM","BA","DIS","NKE","XOM"]
-MIN_PRICE = 0.50
-MAX_PRICE = 2.50
 
 def check_time():
     tz = pytz.timezone("Asia/Riyadh")
@@ -56,7 +53,7 @@ def check_signal(ticker):
         if not exps: return f"✅ {direction} {ticker}\nسعر {price:.2f}$ | RSI {rsi_val:.0f}"
         opt = stock.option_chain(exps[0])
         chain = opt.calls if direction == "CALL" else opt.puts
-        chain = chain[(chain['lastPrice'] >= MIN_PRICE) & (chain['lastPrice'] <= MAX_PRICE)]
+        chain = chain[(chain['lastPrice'] >= 0.50) & (chain['lastPrice'] <= 2.50)]
         if chain.empty: return f"✅ {direction} {ticker} - إشارة قوية بس ما فيه عقد بين 0.50 و 2.50"
         chain = chain.copy(); chain['diff'] = abs(chain['strike'] - price)
         best = chain.sort_values('diff').iloc[0]
@@ -64,21 +61,27 @@ def check_signal(ticker):
         return f"✅ {direction} {ticker} {int(best['strike'])} | {exps[0]}\n💰 دخول: {entry:.2f}$\n🛑 وقف: {stop:.2f}$ (-30%)\n🎯 هدف1: {t1:.2f}$ (+50%)\n🎯 هدف2: {t2:.2f}$ (+100%)\nسعر {price:.2f}$ | RSI {rsi_val:.0f} | زخم {mom15:.2f}%"
     except Exception as e: return f"❌ خطأ: {e}"
 
-@bot.message_handler(commands=['s'])
-def handle_s(m):
-    try:
-        t = m.text.split()[1].upper(); bot.reply_to(m, "🔍 جاري الفحص..."); bot.reply_to(m, check_signal(t))
-    except: bot.reply_to(m, "اكتب: /s META")
-@bot.message_handler(commands=['best'])
-def handle_best(m):
-    bot.reply_to(m, "🔍 جاري فحص كل الأسهم...")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("أهلا 👋\n/s META - فحص سهم\n/best - أفضل الفرص\nيفتح 4:30 العصر الى 12 الليل")
+
+async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("اكتب: /s META"); return
+    t = context.args[0].upper()
+    await update.message.reply_text("🔍 جاري الفحص...")
+    await update.message.reply_text(check_signal(t))
+
+async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 جاري فحص كل الأسهم...")
     res = [check_signal(t) for t in TICKERS]
     res = [r for r in res if r.startswith("✅")]
-    bot.reply_to(m, "\n\n---\n\n".join(res[:5]) if res else "⏳ ما فيه فرص قوية الحين")
-@bot.message_handler(commands=['start'])
-def handle_start(m): bot.reply_to(m, "أهلا 👋\n/s META - فحص سهم\n/best - أفضل الفرص\nيفتح 4:30 العصر الى 12 الليل")
+    await update.message.reply_text("\n\n---\n\n".join(res[:5]) if res else "⏳ ما فيه فرص قوية الحين")
 
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))).start()
+    app_bot = ApplicationBuilder().token(TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start_cmd))
+    app_bot.add_handler(CommandHandler("s", s_cmd))
+    app_bot.add_handler(CommandHandler("best", best_cmd))
     print("POLLING START", flush=True)
-    bot.infinity_polling()
+    app_bot.run_polling()
