@@ -57,9 +57,7 @@ def check_daily_reset():
 def mom(df):
     return (df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100 if len(df) >= 2 else 0
 
-# === جديد: تحليل الشموع فقط - ما يغير اي اعداد ثاني ===
 def detect_candle(df):
-    # يفحص اخر شمعتين
     if len(df) < 2: return ""
     prev_o = float(df['Open'].iloc[-2]); prev_c = float(df['Close'].iloc[-2])
     prev_h = float(df['High'].iloc[-2]); prev_l = float(df['Low'].iloc[-2])
@@ -68,18 +66,14 @@ def detect_candle(df):
     body = abs(c - o)
     rng = h - l
     if rng == 0: return ""
-    # ابتلاع صاعد: شمعة حمراء قبلها، وشمعة خضراء تبلعها
     if prev_c < prev_o and c > o and o <= prev_c and c >= prev_o:
         return "ابتلاع صاعد"
-    # ابتلاع هابط: شمعة خضراء قبلها، وشمعة حمراء تبلعها
     if prev_c > prev_o and c < o and o >= prev_c and c <= prev_o:
         return "ابتلاع هابط"
-    # هامر: جسم صغير فوق، ذيل طويل تحت
     lower = min(o, c) - l
     upper = h - max(o, c)
     if c > o and lower > body * 2 and upper < body * 1.0 and body / rng < 0.35:
         return "هامر"
-    # شوتينق ستار: جسم صغير تحت، ذيل طويل فوق
     if c < o and upper > body * 2 and lower < body * 1.0 and body / rng < 0.35:
         return "شوتينق ستار"
     return ""
@@ -133,16 +127,13 @@ def check_signal(ticker):
         sup1 = float(recent['Low'].min()); res1 = float(recent['High'].max())
         sup2 = float(df3d['Low'].min()); res2 = float(df3d['High'].max())
         direction = None
-        # === جديد: لازم شمعة تأكيد ===
         candle = detect_candle(df15)
-        if m15 >= 0.50 and m1h > 0 and trend3d > 0 and price > vwap and spy_m > 0 and qqq_m > 0 and sec_m > 0 and vol_ok and 45 <= rsi_val <= 70:
-            # للكول لازم ابتلاع صاعد او هامر
+        if m15 >= 0.50 and m1h > 0 and trend3d > 0 and price > vwap and vol_ok and 45 <= rsi_val <= 70:
             if candle in ["ابتلاع صاعد", "هامر"]:
                 direction = "CALL"
             else:
                 return None, ""
-        elif m15 <= -0.50 and m1h < 0 and trend3d < 0 and price < vwap and spy_m < 0 and qqq_m < 0 and sec_m < 0 and vol_ok and 45 <= rsi_val <= 70:
-            # للبوت لازم ابتلاع هابط او شوتينق ستار
+        elif m15 <= -0.50 and m1h < 0 and trend3d < 0 and price < vwap and vol_ok and 45 <= rsi_val <= 70:
             if candle in ["ابتلاع هابط", "شوتينق ستار"]:
                 direction = "PUT"
             else:
@@ -166,8 +157,6 @@ def check_signal(ticker):
         if chain.empty: return None, ""
         best = chain.sort_values('diff').iloc[0]
         entry = float(best['lastPrice']); strike = float(best['strike'])
-        th = float(best.get('theta', 0)) if 'theta' in best else 0
-        if abs(th) > 0.05: return None, ""
         d = float(best.get('delta', 0)) if 'delta' in best else 0
         iv = float(best.get('impliedVolatility', 0))*100 if 'impliedVolatility' in best else 0
         bid = float(best.get('bid', entry)); ask = float(best.get('ask', entry))
@@ -178,7 +167,7 @@ def check_signal(ticker):
         total = entry * 100
         earn = get_earnings(ticker)
         trade = {"ticker": ticker, "direction": direction, "strike": strike, "entry": entry, "stop": stop, "t1": t1, "t2": t2, "exp": exps[0], "price": price, "t1_hit": False}
-        msg = f"🚨 فرصة تلقائية\n✅ {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)\n📊 دلتا {d:.2f} | ثيتا {th:.3f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
+        msg = f"🚨 فرصة تلقائية\n✅ {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)\n📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
         return trade, msg
     except: return None, ""
 
