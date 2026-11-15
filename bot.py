@@ -111,7 +111,6 @@ def check_signal(ticker):
         if len(df15) < 2 or len(df1h) < 2 or len(df3d) < 3: return None, ""
         price = float(df15['Close'].iloc[-1])
         m15 = mom(df15); m1h = mom(df1h)
-        trend3d = (df3d['Close'].iloc[-1] - df3d['Close'].iloc[-3]) / df3d['Close'].iloc[-3] * 100
         typical = (df15['High'] + df15['Low'] + df15['Close']) / 3
         vwap = float((typical * df15['Volume']).sum() / df15['Volume'].sum())
         spy_m = MARKET.get('spy', 0); qqq_m = MARKET.get('qqq', 0); vix = MARKET.get('vix', 20)
@@ -128,12 +127,12 @@ def check_signal(ticker):
         sup2 = float(df3d['Low'].min()); res2 = float(df3d['High'].max())
         direction = None
         candle = detect_candle(df15)
-        if m15 >= 0.50 and m1h > 0 and trend3d > 0 and price > vwap and vol_ok and 45 <= rsi_val <= 70:
+        if m15 >= 0.50 and m1h > 0 and price > vwap and vol_ok and 45 <= rsi_val <= 70:
             if candle in ["ابتلاع صاعد", "هامر"]:
                 direction = "CALL"
             else:
                 return None, ""
-        elif m15 <= -0.50 and m1h < 0 and trend3d < 0 and price < vwap and vol_ok and 45 <= rsi_val <= 70:
+        elif m15 <= -0.50 and m1h < 0 and price < vwap and vol_ok and 45 <= rsi_val <= 70:
             if candle in ["ابتلاع هابط", "شوتينق ستار"]:
                 direction = "PUT"
             else:
