@@ -1,8 +1,25 @@
-import os, yfinance as yf, pandas as pd
+import os, threading
+import yfinance as yf, pandas as pd
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, time
 import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+
+# ===== الباب الوهمي عشان Render يخليه Live مجاني =====
+def keep_alive():
+    port = int(os.environ.get("PORT", 10000))
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive")
+        def log_message(self, *a):
+            pass
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
+
+threading.Thread(target=keep_alive, daemon=True).start()
+# =====================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
 TICKERS = ["AAPL","MSFT","NVDA","TSLA","AMD","META","AMZN","GOOGL","NFLX","SPY","QQQ","XSP","AVGO","PLTR","COIN","MSTR"]
