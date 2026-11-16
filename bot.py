@@ -126,17 +126,16 @@ def check_signal(ticker):
         sup1 = float(recent['Low'].min()); res1 = float(recent['High'].max())
         sup2 = float(df3d['Low'].min()); res2 = float(df3d['High'].max())
         direction = None
+        strength = "متوسطة"
         candle = detect_candle(df15)
         if m15 >= 0.50 and m1h > 0 and price > vwap and vol_ok and 45 <= rsi_val <= 70:
+            direction = "CALL"
             if candle in ["ابتلاع صاعد", "هامر"]:
-                direction = "CALL"
-            else:
-                return None, ""
+                strength = "قوية"
         elif m15 <= -0.50 and m1h < 0 and price < vwap and vol_ok and 45 <= rsi_val <= 70:
+            direction = "PUT"
             if candle in ["ابتلاع هابط", "شوتينق ستار"]:
-                direction = "PUT"
-            else:
-                return None, ""
+                strength = "قوية"
         else: return None, ""
         if direction == "CALL" and (res1 - price) / price * 100 < 0.20: return None, ""
         if direction == "PUT" and (price - sup1) / price * 100 < 0.20: return None, ""
@@ -165,8 +164,10 @@ def check_signal(ticker):
         be = strike + entry if direction == "CALL" else strike - entry
         total = entry * 100
         earn = get_earnings(ticker)
-        trade = {"ticker": ticker, "direction": direction, "strike": strike, "entry": entry, "stop": stop, "t1": t1, "t2": t2, "exp": exps[0], "price": price, "t1_hit": False}
-        msg = f"🚨 فرصة تلقائية\n✅ {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)\n📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
+        candle_txt = candle if candle else "بدون شمعة تأكيد"
+        icon = "🔥" if strength == "قوية" else "⚡"
+        trade = {"ticker": ticker, "direction": direction, "strike": strike, "entry": entry, "stop": stop, "t1": t1, "t2": t2, "exp": exps[0], "price": price, "t1_hit": False, "strength": strength}
+        msg = f"🚨 فرصة تلقائية\n{icon} {strength} | {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle_txt}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)\n📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
         return trade, msg
     except: return None, ""
 
@@ -184,7 +185,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_CHAT_ID
     AUTO_CHAT_ID = update.effective_chat.id
     check_daily_reset()
-    await update.message.reply_text(f"✅ تم تشغيل التنبيه التلقائي\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n🕐 وقت التداول: 9:30 - 16:00 بتوقيت نيويورك - بدون فلتر وقت\n/s META - فحص سهم\n/best - أفضل الفرص\n/results - نسبة النجاح\n/clear - مسح الصفقة")
+    await update.message.reply_text(f"✅ تم تشغيل التنبيه التلقائي\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n🕐 وقت التداول: 9:30 - 16:00 بتوقيت نيويورك - بدون فلتر وقت\n🔥 قوية = مع شمعة تأكيد | ⚡ متوسطة = بدون شمعة\n/s META - فحص سهم\n/best - أفضل الفرص\n/results - نسبة النجاح\n/clear - مسح الصفقة")
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
