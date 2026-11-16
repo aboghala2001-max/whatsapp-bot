@@ -37,9 +37,12 @@ app = Flask(__name__)
 def home():
     return "Bot is running"
 
+def ny_today():
+    return datetime.now(NY).date()
+
 def check_daily_reset():
     global DAILY_COUNT, LAST_RESET_DATE, results
-    today = date.today()
+    today = ny_today()
     if LAST_RESET_DATE != today:
         LAST_RESET_DATE = today
         DAILY_COUNT = 0
@@ -130,7 +133,6 @@ def check_signal(ticker):
         else: strength="خفيفة"
 
         # مدة الفرصة حسب سرعة الزخم، مو حسب القوة
-        # القوية ممكن تكون 15 د، والخفيفة ممكن تكون ساعة
         if abs(mom15) >= 0.50 and vol_ratio >= 2.0:
             duration = "15 د"
         elif abs(mom1h) >= 0.80:
@@ -138,12 +140,11 @@ def check_signal(ticker):
         else:
             duration = "30 د"
 
-        # 2 - فرص يومية فقط - الانتهاء بنفس يوم التداول
-        # مو بكرة ولا بعد بكرة ولا 3 ايام
+        # 2 - فرص يومية فقط - الانتهاء بنفس يوم التداول في نيويورك
         tk = yf.Ticker(ticker)
         try:
             exps = tk.options
-            today_str = date.today().isoformat()
+            today_str = ny_today().isoformat()
             if today_str not in exps:
                 return None, None
             expiry = today_str
@@ -162,11 +163,10 @@ def check_signal(ticker):
                 if entry<=0: entry=2.0
         except:
             pass
-        # ابو 0.17 موجود - ما حذفنا الرخيص لانه فيه فايدة
+        # ابو 0.17 موجود - ما حذفنا الرخيص
         t1 = entry*1.5; t2 = entry*2.0; stop = entry*0.7
         trade = {"ticker":ticker,"direction":direction,"strike":strike,"entry":entry,"t1":t1,"t2":t2,"stop":stop,"expiry":expiry,"t1_hit":False,"strength":strength,"duration":duration}
 
-        # شكل الفرصة - بس اللي تستفيد منه
         msg = NL.join([
             "فرصة " + strength + " " + direction + " " + ticker,
             "الشركة: " + ticker,
@@ -266,8 +266,8 @@ async def auto_scan(app_bot):
         await asyncio.sleep(120)
         if not AUTO_CHAT_ID: continue
         check_daily_reset()
-        if is_end_of_day() and SUMMARY_SENT_DATE != date.today():
-            SUMMARY_SENT_DATE = date.today()
+        if is_end_of_day() and SUMMARY_SENT_DATE != ny_today():
+            SUMMARY_SENT_DATE = ny_today()
             for t in list(ACTIVE.keys()):
                 tr = ACTIVE[t]
                 p = get_option_price(tr)
