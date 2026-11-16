@@ -132,23 +132,31 @@ def check_signal(ticker):
         # --- القوية مثلما هي بالضبط ---
         vol_ok_strong = vol_now >= vol_mean * 1.2
         if m15 >= 0.50 and m1h > 0 and price > vwap and vol_ok_strong and 45 <= rsi_val <= 70:
-            direction = "CALL"
-            strength = "قوية" if candle in ["ابتلاع صاعد", "هامر"] else "متوسطة"
-            if direction == "CALL" and (res1 - price) / price * 100 < 0.20: return None, ""
+            if (res1 - price) / price * 100 < 0.20:
+                direction = None
+            else:
+                direction = "CALL"
+                strength = "قوية" if candle in ["ابتلاع صاعد", "هامر"] else "متوسطة"
         elif m15 <= -0.50 and m1h < 0 and price < vwap and vol_ok_strong and 45 <= rsi_val <= 70:
-            direction = "PUT"
-            strength = "قوية" if candle in ["ابتلاع هابط", "شوتينق ستار"] else "متوسطة"
-            if direction == "PUT" and (price - sup1) / price * 100 < 0.20: return None, ""
+            if (price - sup1) / price * 100 < 0.20:
+                direction = None
+            else:
+                direction = "PUT"
+                strength = "قوية" if candle in ["ابتلاع هابط", "شوتينق ستار"] else "متوسطة"
         # --- الخفيفة: شروط اخف، ربح 20 الى 60 ---
-        elif m15 >= 0.30 and m1h > 0 and price > vwap and vol_now >= vol_mean * 1.0 and 40 <= rsi_val <= 75:
-            direction = "CALL"
-            strength = "خفيفة"
-            if (res1 - price) / price * 100 < 0.10: return None, ""
-        elif m15 <= -0.30 and m1h < 0 and price < vwap and vol_now >= vol_mean * 1.0 and 40 <= rsi_val <= 75:
-            direction = "PUT"
-            strength = "خفيفة"
-            if (price - sup1) / price * 100 < 0.10: return None, ""
-        else: return None, ""
+        if direction is None:
+            if m15 >= 0.30 and m1h > 0 and price > vwap and vol_now >= vol_mean * 1.0 and 40 <= rsi_val <= 75:
+                if (res1 - price) / price * 100 < 0.10:
+                    return None, ""
+                direction = "CALL"
+                strength = "خفيفة"
+            elif m15 <= -0.30 and m1h < 0 and price < vwap and vol_now >= vol_mean * 1.0 and 40 <= rsi_val <= 75:
+                if (price - sup1) / price * 100 < 0.10:
+                    return None, ""
+                direction = "PUT"
+                strength = "خفيفة"
+            else:
+                return None, ""
         exps = stock.options
         if not exps: return None, ""
         opt = stock.option_chain(exps[0])
@@ -212,7 +220,7 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 جاري فحص...")
     load_market()
     trade, msg = check_signal(t)
-    await update.message.reply_text(msg if msg else "⏳ ما فيه فرصة قوية على " + t)
+    await update.message.reply_text(msg if msg else "⏳ ما فيه فرصة قوية ولا خفيفة على " + t)
 
 async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     check_daily_reset()
@@ -223,7 +231,7 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, m = check_signal(t)
         if m: out.append(m)
         if len(out) >= 3: break
-    await update.message.reply_text("\n\n---\n\n".join(out[:3]) if out else "⏳ ما فيه فرص قوية الحين")
+    await update.message.reply_text("\n\n---\n\n".join(out[:3]) if out else "⏳ ما فيه فرص قوية ولا خفيفة الحين")
 
 async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     check_daily_reset()
@@ -257,68 +265,4 @@ async def auto_scan(app_bot):
                     results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": res})
                 del ACTIVE[t]
             wins = sum(1 for r in results if r['result'] == "win")
-            txt = f"🏁 ملخص نهاية الجلسة\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n✅ نجاح: {wins} | ❌ فشل: {len(results)-wins}\n"
-            if results:
-                txt += "\n"
-                for r in results:
-                    icon = "✅" if r['result'] == "win" else "❌"
-                    txt += f"{icon} {r['direction']} {r['ticker']} {int(r['strike'])} | {r['entry']:.2f}$ -> {r['exit']:.2f}$ ({r['pct']:+.0f}%)\n"
-            else: txt += "ما كان فيه فرص انتهت اليوم"
-            try: await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt)
-            except: pass
-            continue
-        if not is_trading_hours(): continue
-        if DAILY_COUNT >= MAX_DAILY: continue
-        try:
-            load_market()
-            for t in list(ACTIVE.keys()):
-                tr = ACTIVE[t]
-                p = get_option_price(tr)
-                if p is None: continue
-                if p >= tr['t2']:
-                    pct = (p - tr['entry']) / tr['entry'] * 100
-                    results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "win"})
-                    await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=f"✅ نجاح كامل {tr['direction']} {t} {int(tr['strike'])}\n💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ (+{pct:.0f}%)\n🎯 وصل الهدف الثاني +100%، الفرصة انتهت")
-                    del ACTIVE[t]
-                elif p >= tr['t1'] and not tr.get('t1_hit'):
-                    tr['t1_hit'] = True
-                    tr['stop'] = tr['entry']
-                    await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=f"🎯 هدف اول {tr['direction']} {t} {int(tr['strike'])}\n💰 دخول {tr['entry']:.2f}$ -> الحين {p:.2f}$ (+50%)\n⚠️ خذ جزء من ربحك، الوقف صار على الدخول، نكمل للهدف الثاني {tr['t2']:.2f}$ (+100%)")
-                elif p <= tr['stop']:
-                    pct = (p - tr['entry']) / tr['entry'] * 100
-                    if tr.get('t1_hit'):
-                        results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "win"})
-                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=f"✅ انتهت بربح {tr['direction']} {t} {int(tr['strike'])}\n💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ ({pct:+.0f}%)\nوصل الهدف الاول قبل، ورجع للوقف على الدخول، الفرصة انتهت")
-                    else:
-                        results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "lose"})
-                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=f"❌ فشل {tr['direction']} {t} {int(tr['strike'])}\n💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ ({pct:.0f}%)\n🛑 ضرب الوقف، الفرصة انتهت")
-                    del ACTIVE[t]
-            for t in TICKERS:
-                if DAILY_COUNT >= MAX_DAILY: break
-                if t in ACTIVE:
-                    trade, msg = check_signal(t)
-                    if trade and ACTIVE[t]['direction'] != trade['direction']:
-                        old = ACTIVE[t]
-                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=f"🔄 تنبيه انعكاس {t}\nكان: {old['direction']} {int(old['strike'])} دخول {old['entry']:.2f}$\nالحين: {trade['direction']} {int(trade['strike'])} دخول {trade['entry']:.2f}$\n⚠️ الفرصة الاولى انتهت")
-                        ACTIVE[t] = trade
-                        DAILY_COUNT += 1
-                    continue
-                trade, msg = check_signal(t)
-                if not trade: continue
-                ACTIVE[t] = trade
-                DAILY_COUNT += 1
-                await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=msg + f"\n📊 فرصة {DAILY_COUNT}/{MAX_DAILY} اليوم")
-        except: pass
-
-async def post_init(app):
-    asyncio.create_task(auto_scan(app))
-
-if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))).start()
-    app_bot = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    app_bot.add_handler(CommandHandler("start", start_cmd))
-    app_bot.add_handler(CommandHandler("s", s_cmd))
-    app_bot.add_handler(CommandHandler("best", best_cmd))
-    app_bot.add_handler(CommandHandler("results", results_cmd))
-    app_bot.add_handler(CommandHandler("clear", clear_cmd))
-    app_bot.run_polling()
+            txt = f"🏁 ملخص نهاية الجلسة\n📊 فرص اليوم: {DAILY_COUNT
