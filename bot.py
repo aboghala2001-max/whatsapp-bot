@@ -11,6 +11,7 @@ app = Flask(__name__)
 @app.route('/')
 def home(): return "Bot is running"
 
+NL = chr(10)
 VIX_LIMIT = 25
 MAX_DAILY = 10
 
@@ -129,7 +130,6 @@ def check_signal(ticker):
         candle = detect_candle(df15)
         direction = None
         strength = ""
-        # --- القوية مثلما هي بالضبط ---
         vol_ok_strong = vol_now >= vol_mean * 1.2
         if m15 >= 0.50 and m1h > 0 and price > vwap and vol_ok_strong and 45 <= rsi_val <= 70:
             if (res1 - price) / price * 100 < 0.20:
@@ -143,7 +143,6 @@ def check_signal(ticker):
             else:
                 direction = "PUT"
                 strength = "قوية" if candle in ["ابتلاع هابط", "شوتينق ستار"] else "متوسطة"
-        # --- الخفيفة: شروط اخف، ربح 20 الى 60 ---
         if direction is None:
             if m15 >= 0.30 and m1h > 0 and price > vwap and vol_now >= vol_mean * 1.0 and 40 <= rsi_val <= 75:
                 if (res1 - price) / price * 100 < 0.10:
@@ -161,7 +160,6 @@ def check_signal(ticker):
         if not exps: return None, ""
         opt = stock.option_chain(exps[0])
         chain = opt.calls if direction == "CALL" else opt.puts
-        # الخفيفة: عقد 0.30 - 0.60 عشان ربحها 20 الى 60
         if strength == "خفيفة":
             chain = chain[(chain['lastPrice'] >= 0.30) & (chain['lastPrice'] <= 0.60)]
         else:
@@ -193,7 +191,19 @@ def check_signal(ticker):
         elif strength == "خفيفة": icon = "🪶"
         else: icon = "⚡"
         trade = {"ticker": ticker, "direction": direction, "strike": strike, "entry": entry, "stop": stop, "t1": t1, "t2": t2, "exp": exps[0], "price": price, "t1_hit": False, "strength": strength}
-        msg = f"🚨 فرصة تلقائية\n{icon} {strength} | {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle_txt}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)\n💵 ربح الهدف الاول {profit1:.0f}$ | ربح الهدف الثاني {profit2:.0f}$\n📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
+        parts = []
+        parts.append("🚨 فرصة تلقائية")
+        parts.append(f"{icon} {strength} | {direction} {ticker} {int(strike)} | {exps[0]}")
+        parts.append(f"🕯️ شمعة: {candle_txt}")
+        parts.append(f"💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$")
+        parts.append(f"🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)")
+        parts.append(f"💵 ربح الهدف الاول {profit1:.0f}$ | ربح الهدف الثاني {profit2:.0f}$")
+        parts.append(f"📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%")
+        parts.append(f"📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}")
+        parts.append(f"🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%")
+        parts.append(f"🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}")
+        parts.append(f"{earn}")
+        msg = NL.join(parts).strip()
         return trade, msg
     except: return None, ""
 
@@ -211,7 +221,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_CHAT_ID
     AUTO_CHAT_ID = update.effective_chat.id
     check_daily_reset()
-    await update.message.reply_text(f"✅ تم تشغيل التنبيه التلقائي\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n🕐 وقت التداول: 9:30 - 16:00 بتوقيت نيويورك - بدون فلتر وقت\n🔥 قوية = مع شمعة تأكيد | ⚡ متوسطة = بدون شمعة | 🪶 خفيفة = شروط اخف ربح 20-60$\n/s META - فحص سهم\n/best - أفضل الفرص\n/results - نسبة النجاح\n/clear - مسح الصفقة")
+    txt = NL.join(["✅ تم تشغيل التنبيه التلقائي", f"📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}", "🕐 وقت التداول: 9:30 - 16:00 بتوقيت نيويورك - بدون فلتر وقت", "🔥 قوية = مع شمعة تأكيد | ⚡ متوسطة = بدون شمعة | 🪶 خفيفة = شروط اخف ربح 20-60$", "/s META - فحص سهم", "/best - أفضل الفرص", "/results - نسبة النجاح", "/clear - مسح الصفقة"])
+    await update.message.reply_text(txt)
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -231,18 +242,22 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, m = check_signal(t)
         if m: out.append(m)
         if len(out) >= 3: break
-    await update.message.reply_text("\n\n---\n\n".join(out[:3]) if out else "⏳ ما فيه فرص قوية ولا خفيفة الحين")
+    sep = NL + NL + "---" + NL + NL
+    await update.message.reply_text(sep.join(out[:3]) if out else "⏳ ما فيه فرص قوية ولا خفيفة الحين")
 
 async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     check_daily_reset()
     if not results:
-        await update.message.reply_text(f"📊 نتائج اليوم: {DAILY_COUNT}/{MAX_DAILY}\nما انتهت اي فرصة بعد"); return
+        await update.message.reply_text(f"📊 نتائج اليوم: {DAILY_COUNT}/{MAX_DAILY}" + NL + "ما انتهت اي فرصة بعد"); return
     wins = sum(1 for r in results if r['result'] == "win")
-    txt = f"📊 نتائج اليوم: {DAILY_COUNT}/{MAX_DAILY}\n✅ نجاح: {wins} | ❌ فشل: {len(results)-wins}\n\n"
+    lines = []
+    lines.append(f"📊 نتائج اليوم: {DAILY_COUNT}/{MAX_DAILY}")
+    lines.append(f"✅ نجاح: {wins} | ❌ فشل: {len(results)-wins}")
+    lines.append("")
     for r in results:
         icon = "✅" if r['result'] == "win" else "❌"
-        txt += f"{icon} {r['direction']} {r['ticker']} {int(r['strike'])} | دخول {r['entry']:.2f}$ -> خروج {r['exit']:.2f}$ ({r['pct']:+.0f}%)\n"
-    await update.message.reply_text(txt)
+        lines.append(f"{icon} {r['direction']} {r['ticker']} {int(r['strike'])} | دخول {r['entry']:.2f}$ -> خروج {r['exit']:.2f}$ ({r['pct']:+.0f}%)")
+    await update.message.reply_text(NL.join(lines))
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ACTIVE.clear()
@@ -265,4 +280,78 @@ async def auto_scan(app_bot):
                     results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": res})
                 del ACTIVE[t]
             wins = sum(1 for r in results if r['result'] == "win")
-            txt = f"🏁 ملخص نهاية الجلسة\n📊 فرص اليوم: {DAILY_COUNT
+            lines = []
+            lines.append("🏁 ملخص نهاية الجلسة")
+            lines.append(f"📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}")
+            lines.append(f"✅ نجاح: {wins} | ❌ فشل: {len(results)-wins}")
+            if results:
+                lines.append("")
+                for r in results:
+                    icon = "✅" if r['result'] == "win" else "❌"
+                    lines.append(f"{icon} {r['direction']} {r['ticker']} {int(r['strike'])} | {r['entry']:.2f}$ -> {r['exit']:.2f}$ ({r['pct']:+.0f}%)")
+            else:
+                lines.append("ما كان فيه فرص انتهت اليوم")
+            txt = NL.join(lines)
+            try: await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt)
+            except: pass
+            continue
+        if not is_trading_hours(): continue
+        if DAILY_COUNT >= MAX_DAILY: continue
+        try:
+            load_market()
+            for t in list(ACTIVE.keys()):
+                tr = ACTIVE[t]
+                p = get_option_price(tr)
+                if p is None: continue
+                if p >= tr['t2']:
+                    pct = (p - tr['entry']) / tr['entry'] * 100
+                    results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "win"})
+                    txt2 = NL.join([f"✅ نجاح كامل {tr['direction']} {t} {int(tr['strike'])}", f"💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ (+{pct:.0f}%)", "🎯 وصل الهدف الثاني +100%، الفرصة انتهت"])
+                    await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                    del ACTIVE[t]
+                elif p >= tr['t1'] and not tr.get('t1_hit'):
+                    tr['t1_hit'] = True
+                    tr['stop'] = tr['entry']
+                    txt2 = NL.join([f"🎯 هدف اول {tr['direction']} {t} {int(tr['strike'])}", f"💰 دخول {tr['entry']:.2f}$ -> الحين {p:.2f}$ (+50%)", f"⚠️ خذ جزء من ربحك، الوقف صار على الدخول، نكمل للهدف الثاني {tr['t2']:.2f}$ (+100%)"])
+                    await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                elif p <= tr['stop']:
+                    pct = (p - tr['entry']) / tr['entry'] * 100
+                    if tr.get('t1_hit'):
+                        results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "win"})
+                        txt2 = NL.join([f"✅ انتهت بربح {tr['direction']} {t} {int(tr['strike'])}", f"💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ ({pct:+.0f}%)", "وصل الهدف الاول قبل، ورجع للوقف على الدخول، الفرصة انتهت"])
+                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                    else:
+                        results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "lose"})
+                        txt2 = NL.join([f"❌ فشل {tr['direction']} {t} {int(tr['strike'])}", f"💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ ({pct:.0f}%)", "🛑 ضرب الوقف، الفرصة انتهت"])
+                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                    del ACTIVE[t]
+            for t in TICKERS:
+                if DAILY_COUNT >= MAX_DAILY: break
+                if t in ACTIVE:
+                    trade, msg = check_signal(t)
+                    if trade and ACTIVE[t]['direction'] != trade['direction']:
+                        old = ACTIVE[t]
+                        txt2 = NL.join([f"🔄 تنبيه انعكاس {t}", f"كان: {old['direction']} {int(old['strike'])} دخول {old['entry']:.2f}$", f"الحين: {trade['direction']} {int(trade['strike'])} دخول {trade['entry']:.2f}$", "⚠️ الفرصة الاولى انتهت"])
+                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                        ACTIVE[t] = trade
+                        DAILY_COUNT += 1
+                    continue
+                trade, msg = check_signal(t)
+                if not trade: continue
+                ACTIVE[t] = trade
+                DAILY_COUNT += 1
+                await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=msg + NL + f"📊 فرصة {DAILY_COUNT}/{MAX_DAILY} اليوم")
+        except: pass
+
+async def post_init(app):
+    asyncio.create_task(auto_scan(app))
+
+if __name__ == "__main__":
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))).start()
+    app_bot = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app_bot.add_handler(CommandHandler("start", start_cmd))
+    app_bot.add_handler(CommandHandler("s", s_cmd))
+    app_bot.add_handler(CommandHandler("best", best_cmd))
+    app_bot.add_handler(CommandHandler("results", results_cmd))
+    app_bot.add_handler(CommandHandler("clear", clear_cmd))
+    app_bot.run_polling()
