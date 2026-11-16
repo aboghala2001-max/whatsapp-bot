@@ -1,291 +1,139 @@
-import os, threading, time, asyncio
-from flask import Flask
-import yfinance as yf
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from datetime import datetime, date
+import os, yfinance as yf, pandas as pd
+from datetime import datetime, time
 import pytz
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN")
-print(f"BOT_TOKEN exists: {bool(TOKEN)}", flush=True)
+TICKERS = ["AAPL","MSFT","NVDA","TSLA","AMD","META","AMZN","GOOGL","NFLX","SPY","QQQ","XSP","AVGO","PLTR","COIN","MSTR"]
+CHAT_IDS = set()
 
-app = Flask(__name__)
-@app.route('/')
-def home(): return "Bot is running OK"
+def market_open():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if now.weekday() >= 5: return False
+    return time(9,30) <= now.time() <= time(16,0)
 
-VIX_LIMIT = 25
-MAX_DAILY = 10
-TICKERS = ["NVDA","TSLA","META","AAPL","AMD","PLTR","COIN","MSFT","AMZN","GOOGL","NFLX","AVGO","MU","SMCI","ARM","SHOP","SQ","PYPL","UBER","ABNB","CRWD","PANW","MRVL","INTC","QCOM","TXN","ADBE","ORCL","CRM","BA","DIS","NKE","XOM","SPY","QQQ"]
-SECTOR = {"NVDA":"XLK","AAPL":"XLK","MSFT":"XLK","AVGO":"XLK","MU":"XLK","SMCI":"XLK","ARM":"XLK","MRVL":"XLK","INTC":"XLK","QCOM":"XLK","TXN":"XLK","ADBE":"XLK","ORCL":"XLK","CRM":"XLK","CRWD":"XLK","PANW":"XLK","TSLA":"XLY","AMZN":"XLY","NFLX":"XLY","SHOP":"XLY","SQ":"XLY","PYPL":"XLY","UBER":"XLY","ABNB":"XLY","DIS":"XLY","NKE":"XLY","META":"XLC","GOOGL":"XLC","PLTR":"XLK","COIN":"XLF","BA":"XLI","XOM":"XLE","SPY":"SPY","QQQ":"QQQ"}
-
-results = []
-ACTIVE = {}
-MARKET = {}
-LAST_MARKET = 0
-AUTO_CHAT_ID = None
-DAILY_COUNT = 0
-DAILY_DATE = None
-SUMMARY_SENT_DATE = None
-
-def is_trading_hours():
+def get_real_option(ticker, side):
     try:
-        ny = pytz.timezone("America/New_York")
-        now = datetime.now(ny)
-        if now.weekday() >= 5: return False
-        mins = now.hour * 60 + now.minute
-        return 570 <= mins <= 960
-    except: return True
-
-def is_end_of_day():
-    try:
-        ny = pytz.timezone("America/New_York")
-        now = datetime.now(ny)
-        if now.weekday() >= 5: return False
-        mins = now.hour * 60 + now.minute
-        return 960 <= mins <= 975
-    except: return False
-
-def check_daily_reset():
-    global DAILY_COUNT, DAILY_DATE, SUMMARY_SENT_DATE
-    today = date.today()
-    if DAILY_DATE != today:
-        DAILY_DATE = today
-        DAILY_COUNT = 0
-        ACTIVE.clear()
-        results.clear()
-        SUMMARY_SENT_DATE = None
-
-def mom(df):
-    try:
-        return (df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100 if len(df) >= 2 else 0
-    except: return 0
-
-def detect_candle(df):
-    try:
-        if len(df) < 2: return ""
-        prev_o = float(df['Open'].iloc[-2]); prev_c = float(df['Close'].iloc[-2])
-        o = float(df['Open'].iloc[-1]); c = float(df['Close'].iloc[-1])
-        h = float(df['High'].iloc[-1]); l = float(df['Low'].iloc[-1])
-        body = abs(c - o); rng = h - l
-        if rng == 0: return ""
-        if prev_c < prev_o and c > o and o <= prev_c and c >= prev_o: return "ابتلاع صاعد"
-        if prev_c > prev_o and c < o and o >= prev_c and c <= prev_o: return "ابتلاع هابط"
-        lower = min(o, c) - l; upper = h - max(o, c)
-        if c > o and lower > body * 2 and upper < body * 1.0 and body / rng < 0.35: return "هامر"
-        if c < o and upper > body * 2 and lower < body * 1.0 and body / rng < 0.35: return "شوتينق ستار"
-        return ""
-    except: return ""
-
-def load_market():
-    global LAST_MARKET
-    if time.time() - LAST_MARKET < 300 and MARKET: return
-    try:
-        MARKET['spy'] = mom(yf.Ticker("SPY").history(period="1d", interval="15m"))
-        MARKET['qqq'] = mom(yf.Ticker("QQQ").history(period="1d", interval="15m"))
-        v = yf.Ticker("^VIX").history(period="1d", interval="15m")
-        MARKET['vix'] = float(v['Close'].iloc[-1]) if len(v) else 20
-        for etf in ["XLK","XLY","XLC","XLF","XLI","XLE","SPY"]:
-            MARKET[etf] = mom(yf.Ticker(etf).history(period="1d", interval="15m"))
-        LAST_MARKET = time.time()
-    except Exception as e: print(f"Market error: {e}", flush=True)
-
-def get_earnings(ticker):
-    try:
-        cal = yf.Ticker(ticker).calendar
-        if cal is not None and 'Earnings Date' in cal:
-            ed = cal['Earnings Date']
-            if isinstance(ed, list): ed = ed[0]
-            days = (ed.date() - datetime.now().date()).days if hasattr(ed, 'date') else 99
-            if 0 <= days <= 3: return f"⚠️ أرباح بعد {days} يوم"
-        return ""
-    except: return ""
-
-def check_signal(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        df15 = stock.history(period="1d", interval="15m")
-        df1h = stock.history(period="2d", interval="60m")
-        df3d = stock.history(period="5d", interval="1d")
-        if len(df15) < 2 or len(df1h) < 2 or len(df3d) < 3: return None, ""
-        price = float(df15['Close'].iloc[-1])
-        m15 = mom(df15); m1h = mom(df1h)
-        typical = (df15['High'] + df15['Low'] + df15['Close']) / 3
-        vwap = float((typical * df15['Volume']).sum() / df15['Volume'].sum()) if df15['Volume'].sum() > 0 else price
-        spy_m = MARKET.get('spy', 0); qqq_m = MARKET.get('qqq', 0); vix = MARKET.get('vix', 20)
-        if vix > VIX_LIMIT: return None, ""
-        sec_etf = SECTOR.get(ticker, "SPY"); sec_m = MARKET.get(sec_etf, 0)
-        delta = df15['Close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = -delta.where(delta < 0, 0).rolling(14).mean()
-        rsi = 100 - (100 / (1 + gain / loss))
-        rsi_val = float(rsi.iloc[-1]) if not rsi.isna().all() else 50
-        vol_ok = float(df15['Volume'].iloc[-1]) >= float(df15['Volume'].mean()) * 1.2
-        recent = df1h.tail(20)
-        sup1 = float(recent['Low'].min()); res1 = float(recent['High'].max())
-        sup2 = float(df3d['Low'].min()); res2 = float(df3d['High'].max())
-        direction = None; strength = "متوسطة"; candle = detect_candle(df15)
-        if m15 >= 0.20 and m1h > 0 and price > vwap and vol_ok and 45 <= rsi_val <= 70:
-            direction = "CALL"
-            if candle in ["ابتلاع صاعد", "هامر"]: strength = "قوية"
-        elif m15 <= -0.20 and m1h < 0 and price < vwap and vol_ok and 45 <= rsi_val <= 70:
-            direction = "PUT"
-            if candle in ["ابتلاع هابط", "شوتينق ستار"]: strength = "قوية"
-        else: return None, ""
-        if direction == "CALL" and (res1 - price) / price * 100 < 0.20: return None, ""
-        if direction == "PUT" and (price - sup1) / price * 100 < 0.20: return None, ""
-        exps = stock.options
-        if not exps: return None, ""
-        opt = stock.option_chain(exps[0])
-        chain = opt.calls if direction == "CALL" else opt.puts
-        chain = chain[(chain['lastPrice'] >= 0.30) & (chain['lastPrice'] <= 1.50)]
-        if 'volume' in chain.columns: chain = chain[chain['volume'].fillna(0) >= 100]
-        if 'openInterest' in chain.columns: chain = chain[chain['openInterest'].fillna(0) >= 500]
-        if chain.empty: return None, ""
-        chain = chain.copy()
-        chain['diff'] = abs(chain['strike'] - price)
-        chain = chain[chain['diff'] / price * 100 <= 8]
-        if chain.empty: return None, ""
-        if 'delta' in chain.columns: chain = chain[(chain['delta'].abs() >= 0.30) & (chain['delta'].abs() <= 0.65)]
-        if chain.empty: return None, ""
-        best = chain.sort_values('diff').iloc[0]
-        entry = float(best['lastPrice']); strike = float(best['strike'])
-        d = float(best.get('delta', 0)) if 'delta' in best else 0
-        iv = float(best.get('impliedVolatility', 0))*100 if 'impliedVolatility' in best else 0
-        bid = float(best.get('bid', entry)); ask = float(best.get('ask', entry))
-        spread = (ask - bid) / entry * 100 if entry else 99
-        if spread > 15: return None, ""
-        stop = entry * 0.80; target = entry * 1.40
-        be = strike + entry if direction == "CALL" else strike - entry
-        total = entry * 100; profit = (target - entry) * 100; loss_amt = (entry - stop) * 100
-        earn = get_earnings(ticker)
-        candle_txt = candle if candle else "بدون شمعة تأكيد"
-        icon = "🔥" if strength == "قوية" else "⚡"
-        trade = {"ticker": ticker, "direction": direction, "strike": strike, "entry": entry, "stop": stop, "t1": target, "exp": exps[0], "price": price, "strength": strength}
-        msg = f"🚨 فرصة تلقائية\n{icon} {strength} | {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle_txt}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🎯 هدف واحد {target:.2f}$ (+40%) = ربح {profit:.0f}$ | بيع العقد كله\n🛑 وقف {stop:.2f}$ (-20%) = خسارة {loss_amt:.0f}$ | بيع العقد كله\n📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
-        return trade, msg
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="1d", interval="1m")
+        if hist.empty: return None
+        if isinstance(hist.columns, pd.MultiIndex): hist.columns = hist.columns.get_level_values(0)
+        underlying = float(hist['Close'].iloc[-1])
+        exps = tk.options
+        if not exps: return None
+        exp = exps[0]
+        chain = tk.option_chain(exp)
+        df = chain.calls if side == "Call" else chain.puts
+        if df.empty: return None
+        df = df.copy()
+        df['diff'] = abs(df['strike'] - underlying)
+        for _, row in df.sort_values('diff').head(5).iterrows():
+            bid = float(row['bid']); ask = float(row['ask']); last = float(row['lastPrice'])
+            if ask <= 0 or bid <= 0: continue
+            spread = (ask - bid) / ask
+            if spread > 0.20: continue
+            vol = int(row.get('volume', 0) or 0)
+            oi = int(row.get('openInterest', 0) or 0)
+            if vol < 10 and oi < 50: continue
+            return {"strike": float(row['strike']), "exp": exp, "bid": round(bid,2), "ask": round(ask,2), "last": round(last,2), "entry": round(ask,2), "underlying": round(underlying,2), "spread": round(spread*100,1), "volume": vol, "oi": oi}
+        return None
     except Exception as e:
-        print(f"Signal error {ticker}: {e}", flush=True)
-        return None, ""
+        print(f"option error {ticker}: {e}")
+        return None
 
-def get_option_price(trade):
+def get_signal(ticker):
+    fetch_ticker = "SPY" if ticker == "XSP" else ticker
     try:
-        stock = yf.Ticker(trade['ticker'])
-        opt = stock.option_chain(trade['exp'])
-        chain = opt.calls if trade['direction'] == "CALL" else opt.puts
-        row = chain[chain['strike'] == trade['strike']]
-        if row.empty: return None
-        return float(row.iloc[0]['lastPrice'])
-    except: return None
+        df = yf.download(fetch_ticker, period="1d", interval="5m", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 20: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        close = df['Close']; vol = df['Volume']
+        vwap = (df['Close']*df['Volume']).cumsum() / df['Volume'].cumsum()
+        last = float(close.iloc[-1]); vwap_last = float(vwap.iloc[-1])
+        delta = close.diff()
+        gain = delta.where(delta>0, 0).rolling(14).mean()
+        loss = (-delta.where(delta<0, 0)).rolling(14).mean()
+        rs = gain / (loss + 0.0001)
+        rsi = float(100 - (100/(1+rs.iloc[-1])))
+        vol_ratio = float(vol.iloc[-1] / (vol.rolling(20).mean().iloc[-1] + 1))
+        is_up = last > vwap_last
+        side = "Call" if is_up else "Put"
+        score = 0
+        if vol_ratio > 1.5: score += 3
+        elif vol_ratio > 1.2: score += 2
+        elif vol_ratio > 0.8: score += 1
+        if is_up and 55 <= rsi <= 68: score += 3
+        elif not is_up and 32 <= rsi <= 45: score += 3
+        elif 50 <= rsi <= 70 or 30 <= rsi <= 50: score += 2
+        if abs(last - vwap_last)/vwap_last > 0.002: score += 2
+        else: score += 1
+        if vol_ratio > 1.2: score += 2
+        if score >= 8 and vol_ratio > 1.2: typ = "قوية 🔥"
+        elif score >= 5: typ = "خفيفة ⚡"
+        else: return None
+        return {"ticker":ticker,"side":side,"type":typ,"rsi":round(rsi,1),"vol":round(vol_ratio,2),"score":score,"vwap_diff":round((last-vwap_last)/vwap_last*100,2)}
+    except Exception as e:
+        print(f"signal error {ticker}: {e}")
+        return None
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_CHAT_ID
-    AUTO_CHAT_ID = update.effective_chat.id
-    check_daily_reset()
-    print(f"START from {AUTO_CHAT_ID}", flush=True)
-    await update.message.reply_text(f"✅ البوت شغال - نسخة جديدة\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n🎯 هدف +40% | 🛑 وقف -20% | عقد واحد - بيع كله\n🔥 قوية = مع شمعة تأكيد | ⚡ متوسطة = بدون شمعة\n/s META - فحص سهم\n/best - أفضل الفرص\n/results - نسبة النجاح\n/clear - مسح الصفقة")
+def format_msg(s, opt):
+    entry = opt['entry']
+    if s['type'].startswith("قوية"):
+        target = round(entry*1.40,2); stop = round(entry*0.80,2); profit = round((target-entry)*100,0)
+    else:
+        target = round(entry*1.18,2); stop = round(entry*0.90,2); profit = round((target-entry)*100,0)
+    stars = "⭐" * (s['score']//2) if s['score']>=4 else "⭐⭐"
+    return (f"🎯 فرصة {s['type']} - {s['ticker']} {s['side']}\n{stars} التقييم: {s['score']}/10\n\nستريك: {opt['strike']} | انتهاء: {opt['exp']}\nسعر السهم: {opt['underlying']}\nBid: {opt['bid']} | Ask: {opt['ask']} | Last: {opt['last']}\nسبريد: {opt['spread']}% | حجم تداول: {opt['volume']} | عقود مفتوحة: {opt['oi']}\n\n✅ اشتري على {entry}\n🎯 بيع على {target} (+{profit}$ لكل عقد)\n🛑 وقف على {stop}\n\nRSI: {s['rsi']} | قوة الحجم: {s['vol']}x | بعيد عن VWAP: {s['vwap_diff']}%\n💡 نصيحة: لا تدخل بأكثر من عقدين اذا راس مالك صغير، ولا تنسى الوقف")
 
-async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("اكتب: /s META"); return
-    t = context.args[0].upper()
-    await update.message.reply_text("🔍 جاري فحص...")
-    load_market()
-    trade, msg = check_signal(t)
-    await update.message.reply_text(msg if msg else "⏳ ما فيه فرصة على " + t)
-
-async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    check_daily_reset()
-    await update.message.reply_text("🔍 جاري فحص كل الشركات...")
-    load_market()
-    out = []
+async def scan_and_send(context: ContextTypes.DEFAULT_TYPE, chat_id=None):
+    if not market_open(): return 0
+    targets = [chat_id] if chat_id else list(CHAT_IDS)
+    if not targets: return 0
+    sent = 0
     for t in TICKERS:
-        _, m = check_signal(t)
-        if m: out.append(m)
-        if len(out) >= 3: break
-    await update.message.reply_text("\n\n---\n\n".join(out[:3]) if out else "⏳ ما فيه فرص الحين")
+        s = get_signal(t)
+        if not s: continue
+        opt = get_real_option(t, s['side'])
+        if not opt: continue
+        msg = format_msg(s, opt)
+        for cid in targets:
+            try: await context.bot.send_message(cid, msg)
+            except: pass
+        sent += 1
+        if sent >= 2: break
+    return sent
 
-async def results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    check_daily_reset()
-    if not results:
-        await update.message.reply_text(f"📊 نتائج اليوم: {DAILY_COUNT}/{MAX_DAILY}\nما انتهت اي فرصة بعد"); return
-    wins = sum(1 for r in results if r['result'] == "win")
-    txt = f"📊 نتائج اليوم: {DAILY_COUNT}/{MAX_DAILY}\n✅ نجاح: {wins} | ❌ فشل: {len(results)-wins}\n\n"
-    for r in results:
-        icon = "✅" if r['result'] == "win" else "❌"
-        txt += f"{icon} {r['direction']} {r['ticker']} {int(r['strike'])} | دخول {r['entry']:.2f}$ -> خروج {r['exit']:.2f}$ ({r['pct']:+.0f}%)\n"
-    await update.message.reply_text(txt)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    CHAT_IDS.add(update.effective_chat.id)
+    if not context.job_queue.jobs():
+        context.job_queue.run_repeating(auto_job, interval=900, first=10, name="auto")
+    await update.message.reply_text("✅ البوت شغال - النسخة النهائية\n\n🔔 تنبيه تلقائي كل 15 دقيقة\n⭐ تقييم لكل فرصة من 10\n🛡️ فلتر سبريد + حجم\n🕐 يشتغل بس وقت السوق\n💰 سعر حقيقي Bid/Ask/Last\n\nارسل /best للفحص الفوري\nارسل /stop لإيقاف التنبيهات")
 
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ACTIVE.clear()
-    await update.message.reply_text("✅ تم مسح الصفقة المسجلة")
+async def best(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not market_open():
+        await update.message.reply_text("🔴 السوق مسكر الحين. البوت يشتغل من 9:30 صباحا لـ 4 عصرا بتوقيت نيويورك.")
+        return
+    await update.message.reply_text("🔍 جاري فحص الاسعار الحقيقية...")
+    sent = await scan_and_send(context, chat_id=update.effective_chat.id)
+    if sent == 0:
+        await update.message.reply_text("ما فيه فرص الحين، حتى الخفيفة. السوق متذبذب. التنبيه التلقائي بيرسل لك اول ما تطلع فرصة.")
 
-async def auto_scan(app_bot):
-    global DAILY_COUNT, SUMMARY_SENT_DATE
-    await asyncio.sleep(10)
-    print("Auto scan started", flush=True)
-    while True:
-        await asyncio.sleep(900)
-        if not AUTO_CHAT_ID: continue
-        check_daily_reset()
-        try:
-            if is_end_of_day() and SUMMARY_SENT_DATE != date.today():
-                SUMMARY_SENT_DATE = date.today()
-                for t in list(ACTIVE.keys()):
-                    tr = ACTIVE[t]
-                    p = get_option_price(tr)
-                    if p is not None:
-                        pct = (p - tr['entry']) / tr['entry'] * 100
-                        res = "win" if pct > 0 else "lose"
-                        results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": res})
-                    del ACTIVE[t]
-                wins = sum(1 for r in results if r['result'] == "win")
-                txt = f"🏁 ملخص نهاية الجلسة\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n✅ نجاح: {wins} | ❌ فشل: {len(results)-wins}\n"
-                if results:
-                    txt += "\n"
-                    for r in results:
-                        icon = "✅" if r['result'] == "win" else "❌"
-                        txt += f"{icon} {r['direction']} {r['ticker']} {int(r['strike'])} | {r['entry']:.2f}$ -> {r['exit']:.2f}$ ({r['pct']:+.0f}%)\n"
-                else: txt += "ما كان فيه فرص انتهت اليوم"
-                try: await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt)
-                except Exception as e: print(f"Summary error: {e}", flush=True)
-                continue
-            if not is_trading_hours(): continue
-            if DAILY_COUNT >= MAX_DAILY: continue
-            load_market()
-            for t in list(ACTIVE.keys()):
-                tr = ACTIVE[t]
-                p = get_option_price(tr)
-                if p is None: continue
-                if p >= tr['t1']:
-                    pct = (p - tr['entry']) / tr['entry'] * 100
-                    results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "win"})
-                    await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=f"✅ نجاح {tr['direction']} {t} {int(tr['strike'])}\n💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ (+{pct:.0f}%)\n🎯 وصل الهدف +40%، بيع العقد كله")
-                    del ACTIVE[t]
-                elif p <= tr['stop']:
-                    pct = (p - tr['entry']) / tr['entry'] * 100
-                    results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "lose"})
-                    await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=f"❌ فشل {tr['direction']} {t} {int(tr['strike'])}\n💰 دخول {tr['entry']:.2f}$ -> خروج {p:.2f}$ ({pct:.0f}%)\n🛑 ضرب الوقف -20%، بيع العقد كله")
-                    del ACTIVE[t]
-            for t in TICKERS:
-                if DAILY_COUNT >= MAX_DAILY: break
-                if t in ACTIVE: continue
-                trade, msg = check_signal(t)
-                if not trade: continue
-                ACTIVE[t] = trade
-                DAILY_COUNT += 1
-                await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=msg + f"\n📊 فرصة {DAILY_COUNT}/{MAX_DAILY} اليوم")
-        except Exception as e: print(f"Auto scan error: {e}", flush=True)
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    CHAT_IDS.discard(update.effective_chat.id)
+    await update.message.reply_text("🔕 وقفت التنبيهات. ارسل /start لتشغيلها من جديد.")
 
-async def post_init(app):
-    asyncio.create_task(auto_scan(app))
+async def auto_job(context: ContextTypes.DEFAULT_TYPE):
+    await scan_and_send(context)
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("best", best))
+    app.add_handler(CommandHandler("stop", stop))
+    print("Bot started - FINAL")
+    app.run_polling()
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000))), daemon=True).start()
-    app_bot = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    app_bot.add_handler(CommandHandler("start", start_cmd))
-    app_bot.add_handler(CommandHandler("s", s_cmd))
-    app_bot.add_handler(CommandHandler("best", best_cmd))
-    app_bot.add_handler(CommandHandler("results", results_cmd))
-    app_bot.add_handler(CommandHandler("clear", clear_cmd))
-    print("Starting polling...", flush=True)
-    app_bot.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    main()
