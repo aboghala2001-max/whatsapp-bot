@@ -5,7 +5,7 @@ import threading
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from flask import Flask
 from telegram import Update
@@ -15,10 +15,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", 10000))
 NL = "\n"
 NY = ZoneInfo("America/New_York")
-
 TICKERS = ["AAPL","MSFT","NVDA","TSLA","META","AMZN","GOOGL","NFLX","AMD","AVGO","PLTR","COIN","MSTR","SMCI","ARM","MU","QCOM","INTC","BA","DIS","JPM","BAC","XOM","CVX","SPY","QQQ","XSP","IWM","DIA","AAL","UAL","NKE","SOFI","HOOD","MARA","RIOT","RBLX"]
 INDICES = ["SPY","QQQ","XSP"]
-
 ACTIVE = {}
 results = []
 DAILY_COUNT = 0
@@ -74,7 +72,15 @@ def get_rsi(close, period=14):
     rsi = 100 - (100/(1+rs))
     return float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
 
-# ===== التعديل الجديد: سعر حقيقي Bid / Ask =====
+def safe_float(v):
+    try:
+        f = float(v)
+        if pd.isna(f):
+            return 0.0
+        return f
+    except:
+        return 0.0
+
 def get_real_option_info(tr):
     try:
         t = yf.Ticker(tr['ticker'])
@@ -84,10 +90,9 @@ def get_real_option_info(tr):
         if len(row)==0:
             return None
         r = row.iloc[0]
-        bid = float(r.get('bid', 0) or 0)
-        ask = float(r.get('ask', 0) or 0)
-        last = float(r.get('lastPrice', 0) or 0)
-        # سعر حقيقي = متوسط Bid / Ask
+        bid = safe_float(r.get('bid', 0))
+        ask = safe_float(r.get('ask', 0))
+        last = safe_float(r.get('lastPrice', 0))
         if bid > 0 and ask > 0:
             price = (bid + ask) / 2
             spread = (ask - bid) / price if price > 0 else 1
@@ -113,7 +118,8 @@ def check_signal(ticker):
             df.columns = df.columns.get_level_values(0)
         close = df['Close']
         vol = df['Volume']
-        c0 = float(close.iloc[-1]); c1 = float(close.iloc[-2])
+        c0 = float(close.iloc[-1])
+        c1 = float(close.iloc[-2])
         if c0 > 250:
             return None, None
         mom15 = (c0-c1)/c1*100
@@ -122,22 +128,32 @@ def check_signal(ticker):
         vwap = float((close*vol).cumsum().iloc[-1] / (vol.cumsum().iloc[-1]+1e-9))
         avg_vol = float(vol.iloc[-20:-1].mean())
         vol_ratio = float(vol.iloc[-1]/(avg_vol+1e-9))
-        direction = None; strength = None; score = 0
+        direction = None
+        strength = None
+        score = 0
         if mom15>0.25 and mom1h>0.4 and rsi>55 and c0>vwap and vol_ratio>1.2:
-            direction="CALL"; score+=3
+            direction="CALL"
+            score+=3
         elif mom15<-0.25 and mom1h<-0.4 and rsi<45 and c0<vwap and vol_ratio>1.2:
-            direction="PUT"; score+=3
+            direction="PUT"
+            score+=3
         elif mom15>0.15 and mom1h>0.2 and rsi>52:
-            direction="CALL"; score+=2
+            direction="CALL"
+            score+=2
         elif mom15<-0.15 and mom1h<-0.2 and rsi<48:
-            direction="PUT"; score+=2
+            direction="PUT"
+            score+=2
         elif abs(mom15)>0.08:
-            direction="CALL" if mom15>0 else "PUT"; score+=1
+            direction="CALL" if mom15>0 else "PUT"
+            score+=1
         else:
             return None, None
-        if score>=3: strength="قوية"
-        elif score==2: strength="متوسطة"
-        else: strength="خفيفة"
+        if score>=3:
+            strength="قوية"
+        elif score==2:
+            strength="متوسطة"
+        else:
+            strength="خفيفة"
         if abs(mom15) >= 0.50 and vol_ratio >= 2.0:
             duration = "15 د"
         elif abs(mom1h) >= 0.80:
@@ -155,37 +171,41 @@ def check_signal(ticker):
             return None, None
         strike = round(c0)
         entry = 2.5 if strength=="قوية" else 2.0
-        bid = 0; ask = 0; price_source = "LAST"
+        bid = 0
+        ask = 0
+        price_source = "LAST"
         try:
             oc = tk.option_chain(expiry)
             chain = oc.calls if direction=="CALL" else oc.puts
-            row = chain.iloc[(chain['strike']-strike).abs().argsort()[:1]]
+            idx = (chain['strike']-strike).abs().idxmin()
+            row = chain.loc[[idx]]
             if len(row)>0:
                 strike = float(row.iloc[0]['strike'])
-                # ===== السعر الحقيقي هنا =====
-                bid = float(row.iloc[0].get('bid', 0) or 0)
-                ask = float(row.iloc[0].get('ask', 0) or 0)
-                last = float(row.iloc[0].get('lastPrice', 0) or 0)
+                bid = safe_float(row.iloc[0].get('bid', 0))
+                ask = safe_float(row.iloc[0].get('ask', 0))
+                last = safe_float(row.iloc[0].get('lastPrice', 0))
                 if bid > 0 and ask > 0:
                     entry = (bid + ask) / 2
                     price_source = "BID/ASK"
                     spread = (ask - bid) / entry if entry > 0 else 1
-                    # اذا السبريد واسع اكثر من 20% الغي الفرصة
                     if spread > 0.20:
                         return None, None
                 elif last > 0:
                     entry = last
                     price_source = "LAST"
-                if entry<=0: entry=2.0
+                if entry<=0 or pd.isna(entry):
+                    entry=2.0
         except:
             pass
-        t1 = entry*1.5; t2 = entry*2.0; stop = entry*0.7
+        t1 = entry*1.5
+        t2 = entry*2.0
+        stop = entry*0.7
         trade = {"ticker":ticker,"direction":direction,"strike":strike,"entry":entry,"t1":t1,"t2":t2,"stop":stop,"expiry":expiry,"t1_hit":False,"strength":strength,"duration":duration,"max_price":entry,"bid":bid,"ask":ask,"price_source":price_source}
         price_line = "السعر: " + format(entry, ".2f") + "$ (Bid " + format(bid, ".2f") + " / Ask " + format(ask, ".2f") + ")"
         if price_source == "LAST":
-            price_line += " ⚠️ سعر قديم - تأكد من منصتك"
+            price_line += " سعر قديم - تأكد من منصتك"
         else:
-            price_line += " ✅ سعر حقيقي Bid/Ask"
+            price_line += " سعر حقيقي Bid/Ask"
         msg = NL.join([
             "فرصة " + strength + " " + direction + " " + ticker,
             "الشركة: " + ticker,
@@ -205,7 +225,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_CHAT_ID
     AUTO_CHAT_ID = update.effective_chat.id
     check_daily_reset()
-    await update.message.reply_text("تم تشغيل المسح التلقائي - يبدأ 9:00 قبل السوق بنص ساعة - ينتهي 4:00 مع الاغلاق - قوية + متوسطة كل دقيقتين - خفيفة كل 15 دقيقة - فرص يومية فقط - سعر تحت 250$")
+    await update.message.reply_text("تم تشغيل المسح التلقائي")
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -282,7 +302,8 @@ async def auto_scan(app_bot):
     last_light_check = 0
     while True:
         await asyncio.sleep(120)
-        if not AUTO_CHAT_ID: continue
+        if not AUTO_CHAT_ID:
+            continue
         check_daily_reset()
         if is_end_of_day() and SUMMARY_SENT_DATE != ny_today():
             SUMMARY_SENT_DATE = ny_today()
@@ -309,11 +330,15 @@ async def auto_scan(app_bot):
                     lines.append(icon + " " + r['direction'] + " " + r['ticker'] + " | السترايك: " + str(int(r['strike'])) + " | السعر: " + format(r['entry'], ".2f") + "$ -> " + format(r['exit'], ".2f") + "$ (" + format(r['pct'], "+.0f") + "%) | اعلى سعر: " + format(r.get('max_price', r['exit']), ".2f") + "$ (" + format(r.get('max_pct', r['pct']), "+.0f") + "%)")
             else:
                 lines.append("ما كان فيه فرص انتهت اليوم")
-            try: await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=NL.join(lines))
-            except: pass
+            try:
+                await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=NL.join(lines))
+            except:
+                pass
             continue
-        if not is_trading_hours(): continue
-        if DAILY_COUNT >= MAX_DAILY: continue
+        if not is_trading_hours():
+            continue
+        if DAILY_COUNT >= MAX_DAILY:
+            continue
         is_light_time = (time.time() - last_light_check) >= 900
         if is_light_time:
             last_light_check = time.time()
@@ -322,7 +347,8 @@ async def auto_scan(app_bot):
             for t in list(ACTIVE.keys()):
                 tr = ACTIVE[t]
                 p = get_option_price(tr)
-                if p is None: continue
+                if p is None:
+                    continue
                 if p > tr.get('max_price', tr['entry']):
                     tr['max_price'] = p
                 max_pct = (tr.get('max_price', p) - tr['entry']) / tr['entry'] * 100
@@ -354,4 +380,89 @@ async def auto_scan(app_bot):
                         "اعلى سعر وصل له: " + format(tr.get('max_price', p), ".2f") + "$ (" + format(max_pct, "+.0f") + "%)",
                         "الهدف الاول: " + format(tr['t1'], ".2f") + "$ - وصل",
                         "الهدف الثاني: " + format(tr['t2'], ".2f") + "$ - باقي",
-                        "
+                        "الوقف: " + format(tr['entry'], ".2f") + "$ - صار على الدخول",
+                        "مدة الفرصة: " + tr.get('duration',''),
+                        "انتهاء الخيار: " + str(tr['expiry'])
+                    ])
+                    await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                elif p <= tr['stop']:
+                    pct = (p - tr['entry']) / tr['entry'] * 100
+                    if tr.get('t1_hit'):
+                        results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "win", "max_price": tr.get('max_price', p), "max_pct": max_pct})
+                        txt2 = NL.join([
+                            "انتهت بربح " + tr['direction'] + " " + t,
+                            "الشركة: " + t,
+                            "السترايك: " + str(int(tr['strike'])),
+                            "السعر: " + format(tr['entry'], ".2f") + "$ -> " + format(p, ".2f") + "$ (" + format(pct, "+.0f") + "%)",
+                            "اعلى سعر وصل له: " + format(tr.get('max_price', p), ".2f") + "$ (" + format(max_pct, "+.0f") + "%)",
+                            "الهدف الاول: " + format(tr['t1'], ".2f") + "$ - وصل قبل",
+                            "الهدف الثاني: " + format(tr['t2'], ".2f") + "$",
+                            "الوقف: " + format(tr['entry'], ".2f") + "$ - ضرب على الدخول",
+                            "مدة الفرصة: " + tr.get('duration',''),
+                            "انتهاء الخيار: " + str(tr['expiry'])
+                        ])
+                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                    else:
+                        results.append({"ticker": t, "direction": tr['direction'], "strike": tr['strike'], "entry": tr['entry'], "exit": p, "pct": pct, "result": "lose", "max_price": tr.get('max_price', p), "max_pct": max_pct})
+                        txt2 = NL.join([
+                            "فشل " + tr['direction'] + " " + t,
+                            "الشركة: " + t,
+                            "السترايك: " + str(int(tr['strike'])),
+                            "السعر: " + format(tr['entry'], ".2f") + "$ -> " + format(p, ".2f") + "$ (" + format(pct, ".0f") + "%)",
+                            "اعلى سعر وصل له: " + format(tr.get('max_price', p), ".2f") + "$ (" + format(max_pct, "+.0f") + "%)",
+                            "الهدف الاول: " + format(tr['t1'], ".2f") + "$",
+                            "الهدف الثاني: " + format(tr['t2'], ".2f") + "$",
+                            "الوقف: " + format(tr['stop'], ".2f") + "$ - ضرب",
+                            "مدة الفرصة: " + tr.get('duration',''),
+                            "انتهاء الخيار: " + str(tr['expiry'])
+                        ])
+                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                    del ACTIVE[t]
+            for t in TICKERS:
+                if DAILY_COUNT >= MAX_DAILY:
+                    break
+                if t in ACTIVE:
+                    trade, msg = check_signal(t)
+                    if trade and ACTIVE[t]['direction'] != trade['direction']:
+                        old = ACTIVE[t]
+                        txt2 = NL.join([
+                            "تنبيه انعكاس " + t,
+                            "الشركة: " + t,
+                            "كان: " + old['direction'] + " السترايك: " + str(int(old['strike'])) + " السعر: " + format(old['entry'], ".2f") + "$",
+                            "الحين: " + trade['direction'] + " السترايك: " + str(int(trade['strike'])) + " السعر: " + format(trade['entry'], ".2f") + "$",
+                            "الهدف الاول: " + format(trade['t1'], ".2f") + "$ | الهدف الثاني: " + format(trade['t2'], ".2f") + "$ | الوقف: " + format(trade['stop'], ".2f") + "$",
+                            "مدة الفرصة: " + trade.get('duration',''),
+                            "الفرصة الاولى انتهت"
+                        ])
+                        await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=txt2)
+                        ACTIVE[t] = trade
+                        DAILY_COUNT += 1
+                    continue
+                trade, msg = check_signal(t)
+                if not trade:
+                    continue
+                if trade['strength'] == "خفيفة" and not is_light_time:
+                    continue
+                ACTIVE[t] = trade
+                DAILY_COUNT += 1
+                await app_bot.bot.send_message(chat_id=AUTO_CHAT_ID, text=msg + NL + "فرصة " + str(DAILY_COUNT) + "/" + str(MAX_DAILY) + " اليوم")
+        except:
+            pass
+
+async def main():
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start_cmd))
+    tg_app.add_handler(CommandHandler("s", s_cmd))
+    tg_app.add_handler(CommandHandler("best", best_cmd))
+    tg_app.add_handler(CommandHandler("results", results_cmd))
+    tg_app.add_handler(CommandHandler("clear", clear_cmd))
+    asyncio.create_task(auto_scan(tg_app))
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling()
+    while True:
+        await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
+    asyncio.run(main())
