@@ -121,29 +121,43 @@ def check_signal(ticker):
         loss = -delta.where(delta < 0, 0).rolling(14).mean()
         rsi = 100 - (100 / (1 + gain / loss))
         rsi_val = float(rsi.iloc[-1]) if not rsi.isna().all() else 50
-        vol_ok = float(df15['Volume'].iloc[-1]) >= float(df15['Volume'].mean()) * 1.2
+        vol_mean = float(df15['Volume'].mean())
+        vol_now = float(df15['Volume'].iloc[-1])
         recent = df1h.tail(20)
         sup1 = float(recent['Low'].min()); res1 = float(recent['High'].max())
         sup2 = float(df3d['Low'].min()); res2 = float(df3d['High'].max())
-        direction = None
-        strength = "متوسطة"
         candle = detect_candle(df15)
-        if m15 >= 0.50 and m1h > 0 and price > vwap and vol_ok and 45 <= rsi_val <= 70:
+        direction = None
+        strength = ""
+        # --- القوية مثلما هي بالضبط ---
+        vol_ok_strong = vol_now >= vol_mean * 1.2
+        if m15 >= 0.50 and m1h > 0 and price > vwap and vol_ok_strong and 45 <= rsi_val <= 70:
             direction = "CALL"
-            if candle in ["ابتلاع صاعد", "هامر"]:
-                strength = "قوية"
-        elif m15 <= -0.50 and m1h < 0 and price < vwap and vol_ok and 45 <= rsi_val <= 70:
+            strength = "قوية" if candle in ["ابتلاع صاعد", "هامر"] else "متوسطة"
+            if direction == "CALL" and (res1 - price) / price * 100 < 0.20: return None, ""
+        elif m15 <= -0.50 and m1h < 0 and price < vwap and vol_ok_strong and 45 <= rsi_val <= 70:
             direction = "PUT"
-            if candle in ["ابتلاع هابط", "شوتينق ستار"]:
-                strength = "قوية"
+            strength = "قوية" if candle in ["ابتلاع هابط", "شوتينق ستار"] else "متوسطة"
+            if direction == "PUT" and (price - sup1) / price * 100 < 0.20: return None, ""
+        # --- الخفيفة: شروط اخف، ربح 20 الى 60 ---
+        elif m15 >= 0.30 and m1h > 0 and price > vwap and vol_now >= vol_mean * 1.0 and 40 <= rsi_val <= 75:
+            direction = "CALL"
+            strength = "خفيفة"
+            if (res1 - price) / price * 100 < 0.10: return None, ""
+        elif m15 <= -0.30 and m1h < 0 and price < vwap and vol_now >= vol_mean * 1.0 and 40 <= rsi_val <= 75:
+            direction = "PUT"
+            strength = "خفيفة"
+            if (price - sup1) / price * 100 < 0.10: return None, ""
         else: return None, ""
-        if direction == "CALL" and (res1 - price) / price * 100 < 0.20: return None, ""
-        if direction == "PUT" and (price - sup1) / price * 100 < 0.20: return None, ""
         exps = stock.options
         if not exps: return None, ""
         opt = stock.option_chain(exps[0])
         chain = opt.calls if direction == "CALL" else opt.puts
-        chain = chain[(chain['lastPrice'] >= 0.30) & (chain['lastPrice'] <= 2.50)]
+        # الخفيفة: عقد 0.30 - 0.60 عشان ربحها 20 الى 60
+        if strength == "خفيفة":
+            chain = chain[(chain['lastPrice'] >= 0.30) & (chain['lastPrice'] <= 0.60)]
+        else:
+            chain = chain[(chain['lastPrice'] >= 0.30) & (chain['lastPrice'] <= 2.50)]
         if 'volume' in chain.columns: chain = chain[chain['volume'].fillna(0) >= 100]
         if 'openInterest' in chain.columns: chain = chain[chain['openInterest'].fillna(0) >= 500]
         if chain.empty: return None, ""
@@ -163,11 +177,15 @@ def check_signal(ticker):
         stop = entry * 0.70; t1 = entry * 1.50; t2 = entry * 2.00
         be = strike + entry if direction == "CALL" else strike - entry
         total = entry * 100
+        profit1 = (t1 - entry) * 100
+        profit2 = (t2 - entry) * 100
         earn = get_earnings(ticker)
         candle_txt = candle if candle else "بدون شمعة تأكيد"
-        icon = "🔥" if strength == "قوية" else "⚡"
+        if strength == "قوية": icon = "🔥"
+        elif strength == "خفيفة": icon = "🪶"
+        else: icon = "⚡"
         trade = {"ticker": ticker, "direction": direction, "strike": strike, "entry": entry, "stop": stop, "t1": t1, "t2": t2, "exp": exps[0], "price": price, "t1_hit": False, "strength": strength}
-        msg = f"🚨 فرصة تلقائية\n{icon} {strength} | {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle_txt}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)\n📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
+        msg = f"🚨 فرصة تلقائية\n{icon} {strength} | {direction} {ticker} {int(strike)} | {exps[0]}\n🕯️ شمعة: {candle_txt}\n💰 دخول {entry:.2f}$ | إجمالي {total:.0f}$ | تعادل {be:.2f}$\n🛑 وقف {stop:.2f}$ (-30%) | 🎯 {t1:.2f}$ (+50%) / {t2:.2f}$ (+100%)\n💵 ربح الهدف الاول {profit1:.0f}$ | ربح الهدف الثاني {profit2:.0f}$\n📊 دلتا {d:.2f} | IV {iv:.0f}% | سبريد {spread:.0f}%\n📈 RSI {rsi_val:.0f} | VWAP {vwap:.2f}$ | زخم {m15:.2f}% | VIX {vix:.1f}\n🌐 SPY {spy_m:.2f}% | QQQ {qqq_m:.2f}% | قطاع {sec_etf} {sec_m:.2f}%\n🛡️ دعم {sup1:.2f} / {sup2:.2f} | مقاومة {res1:.2f} / {res2:.2f}\n{earn}".strip()
         return trade, msg
     except: return None, ""
 
@@ -185,7 +203,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_CHAT_ID
     AUTO_CHAT_ID = update.effective_chat.id
     check_daily_reset()
-    await update.message.reply_text(f"✅ تم تشغيل التنبيه التلقائي\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n🕐 وقت التداول: 9:30 - 16:00 بتوقيت نيويورك - بدون فلتر وقت\n🔥 قوية = مع شمعة تأكيد | ⚡ متوسطة = بدون شمعة\n/s META - فحص سهم\n/best - أفضل الفرص\n/results - نسبة النجاح\n/clear - مسح الصفقة")
+    await update.message.reply_text(f"✅ تم تشغيل التنبيه التلقائي\n📊 فرص اليوم: {DAILY_COUNT}/{MAX_DAILY}\n🕐 وقت التداول: 9:30 - 16:00 بتوقيت نيويورك - بدون فلتر وقت\n🔥 قوية = مع شمعة تأكيد | ⚡ متوسطة = بدون شمعة | 🪶 خفيفة = شروط اخف ربح 20-60$\n/s META - فحص سهم\n/best - أفضل الفرص\n/results - نسبة النجاح\n/clear - مسح الصفقة")
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
