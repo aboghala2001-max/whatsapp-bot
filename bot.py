@@ -5,7 +5,7 @@ import threading
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask
 from telegram import Update
@@ -46,10 +46,12 @@ def check_daily_reset():
         results = []
 
 def is_trading_hours():
+    # يبدأ قبل السوق بنص ساعة - 9:00، وينتهي مع الاغلاق 4:00
     now = datetime.now(NY).time()
-    return dtime(9,30) <= now <= dtime(16,0)
+    return dtime(9,0) <= now <= dtime(16,0)
 
 def is_end_of_day():
+    # التقييم بعد الاغلاق مباشرة
     now = datetime.now(NY).time()
     return dtime(16,0) <= now <= dtime(16,15)
 
@@ -96,6 +98,11 @@ def check_signal(ticker):
         close = df['Close']
         vol = df['Volume']
         c0 = float(close.iloc[-1]); c1 = float(close.iloc[-2])
+
+        # 1 - السعر ما يتجاوز 250 دولار - فوق 250 نلغيه من الاساس
+        if c0 > 250:
+            return None, None
+
         mom15 = (c0-c1)/c1*100
         mom1h = (c0-float(close.iloc[-5]))/float(close.iloc[-5])*100 if len(close)>=5 else 0
         rsi = get_rsi(close)
@@ -131,17 +138,19 @@ def check_signal(ticker):
         else:
             duration = "30 د"
 
-        strike = round(c0)
+        # 2 - فرص يومية فقط - الانتهاء بنفس يوم التداول
+        # مو بكرة ولا بعد بكرة ولا 3 ايام
         tk = yf.Ticker(ticker)
         try:
             exps = tk.options
             today_str = date.today().isoformat()
-            future_exps = [e for e in exps if e > today_str]
-            expiry = future_exps[0] if future_exps else exps[0]
+            if today_str not in exps:
+                return None, None
+            expiry = today_str
         except:
-            expiry = None
-        if not expiry:
             return None, None
+
+        strike = round(c0)
         entry = 2.5 if strength=="قوية" else 2.0
         try:
             oc = tk.option_chain(expiry)
@@ -177,7 +186,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_CHAT_ID
     AUTO_CHAT_ID = update.effective_chat.id
     check_daily_reset()
-    await update.message.reply_text("تم تشغيل المسح التلقائي - قوية + متوسطة كل دقيقتين - خفيفة كل 15 دقيقة - وقت السوق 9:30 - 4:00 نيويورك")
+    await update.message.reply_text("تم تشغيل المسح التلقائي - يبدأ 9:00 قبل السوق بنص ساعة - ينتهي 4:00 مع الاغلاق - قوية + متوسطة كل دقيقتين - خفيفة كل 15 دقيقة - فرص يومية فقط - سعر تحت 250$")
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
