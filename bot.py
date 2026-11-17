@@ -127,10 +127,10 @@ def check_signal(ticker):
         direction = None
         strength = None
         score = 0
-        if mom15>0.25 and mom1h>0.4 and rsi>55 and c0>vwap and vol_ratio>1.2:
+        if mom15>0.25 and mom1h>0.4 and rsi>55 and c0>vwap:
             direction="CALL"
             score+=3
-        elif mom15<-0.25 and mom1h<-0.4 and rsi<45 and c0<vwap and vol_ratio>1.2:
+        elif mom15<-0.25 and mom1h<-0.4 and rsi<45 and c0<vwap:
             direction="PUT"
             score+=3
         elif mom15>0.15 and mom1h>0.2 and rsi>52:
