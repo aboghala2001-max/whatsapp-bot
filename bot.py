@@ -63,36 +63,45 @@ def get_candles(ticker):
         print("candles err", ticker, e)
         return None
 
-def get_option_price(ticker, strike, is_call, expiry):
+def get_option_price(ticker, strike, is_call):
     try:
         tk = yf.Ticker(ticker)
-        chain = tk.option_chain(expiry)
-        opts = chain.calls if is_call else chain.puts
-        if opts is None or opts.empty:
+        exps = tk.options
+        if not exps:
             return None
-        opts = opts.copy()
-        opts["diff"] = abs(opts["strike"] - strike)
-        row = opts.sort_values("diff").iloc[0]
-        bid = float(row.get("bid", 0) or 0)
-        ask = float(row.get("ask", 0) or 0)
-        last = float(row.get("lastPrice", 0) or 0)
-        price = 0
-        if bid > 0 and ask > 0:
-            price = (bid + ask) / 2
-        elif last > 0:
-            price = last
-        elif ask > 0:
-            price = ask
-        else:
-            return None
-        return {
-            "entry": round(price, 2),
-            "bid": round(bid, 2),
-            "ask": round(ask, 2),
-            "strike": float(row["strike"]),
-            "vol": int(row.get("volume", 0) or 0),
-            "oi": int(row.get("openInterest", 0) or 0),
-        }
+        for expiry in exps[:4]:
+            try:
+                chain = tk.option_chain(expiry)
+                opts = chain.calls if is_call else chain.puts
+                if opts is None or opts.empty:
+                    continue
+                opts = opts.copy()
+                opts["diff"] = abs(opts["strike"] - strike)
+                row = opts.sort_values("diff").iloc[0]
+                bid = float(row.get("bid", 0) or 0)
+                ask = float(row.get("ask", 0) or 0)
+                last = float(row.get("lastPrice", 0) or 0)
+                price = 0
+                if bid > 0 and ask > 0:
+                    price = (bid + ask) / 2
+                elif last > 0:
+                    price = last
+                elif ask > 0:
+                    price = ask
+                else:
+                    continue
+                return {
+                    "entry": round(price, 2),
+                    "bid": round(bid, 2),
+                    "ask": round(ask, 2),
+                    "strike": float(row["strike"]),
+                    "vol": int(row.get("volume", 0) or 0),
+                    "oi": int(row.get("openInterest", 0) or 0),
+                    "expiry": expiry,
+                }
+            except:
+                continue
+        return None
     except Exception as e:
         print("opt err", ticker, e)
         return None
@@ -161,28 +170,11 @@ def analyze(ticker):
     else:
         strike = float(np.floor(c0)) if c0 < 100 else float(np.floor(c0 / 5) * 5)
 
-    now_ny = datetime.now(NY)
-    days_to_fri = (4 - now_ny.weekday()) % 7
-    if days_to_fri == 0 and now_ny.hour >= 16:
-        days_to_fri = 7
-    expiry_date = (now_ny + timedelta(days=days_to_fri)).date()
-    expiry_str = expiry_date.strftime("%Y-%m-%d")
-    expiry_show = expiry_date.strftime("%d-%m-%Y")
-
-    opt = get_option_price(ticker, strike, direction == "CALL", expiry_str)
-    used_expiry = expiry_show
-    if opt is None:
-        try:
-            tk = yf.Ticker(ticker)
-            exps = tk.options
-            if exps:
-                opt = get_option_price(ticker, strike, direction == "CALL", exps[0])
-                used_expiry = exps[0]
-        except:
-            pass
+    opt = get_option_price(ticker, strike, direction == "CALL")
     if opt is None:
         LAST_DEBUG[ticker] = f"سعر {c0:.2f} | ما فيه اوبشن للسترايك {strike}"
         return None
+    used_expiry = opt["expiry"]
 
     entry = opt["entry"]
     if entry <= 0 or pd.isna(entry):
