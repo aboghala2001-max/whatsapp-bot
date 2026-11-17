@@ -36,6 +36,14 @@ CHAT_IDS = set()
 LAST_LIGHT_SENT = 0
 NY = pytz.timezone("America/New_York")
 
+# جلسة متصفح حقيقي - عشان Yahoo ما يحظرنا
+try:
+    from curl_cffi import requests as cffi_requests
+    CFFI_SESSION = cffi_requests.Session(impersonate="chrome")
+except Exception as e:
+    print("curl_cffi not available", e)
+    CFFI_SESSION = None
+
 def today_str():
     return datetime.now(NY).strftime("%Y-%m-%d")
 
@@ -55,7 +63,6 @@ def get_candles(ticker):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna()
-        # اخر شمعة مغلقة فقط - نحذف الشمعة الحالية اللي لسه مفتوحة
         if len(df) > 1:
             df = df.iloc[:-1]
         return df
@@ -83,41 +90,44 @@ def _parse_opt_list(lst, strike):
     }
 
 def get_option_price(ticker, strike, is_call):
-    import urllib.request, json
-    # الطريقة 1: مباشرة من Yahoo
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        url0 = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={ticker}"
-        req0 = urllib.request.Request(url0, headers=headers)
-        data0 = json.loads(urllib.request.urlopen(req0, timeout=15).read())
-        res0 = data0.get("optionChain", {}).get("result", [])
-        if res0:
-            exps = res0[0].get("expirationDates", [])
-            for exp_ts in exps[:8]:
-                try:
-                    url = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={ticker}&date={exp_ts}"
-                    req = urllib.request.Request(url, headers=headers)
-                    data = json.loads(urllib.request.urlopen(req, timeout=15).read())
-                    res = data.get("optionChain", {}).get("result", [])
-                    if not res:
+    import json
+    # الطريقة 1: Yahoo بمتصفح حقيقي curl_cffi
+    if CFFI_SESSION is not None:
+        try:
+            url0 = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={ticker}"
+            r0 = CFFI_SESSION.get(url0, timeout=15)
+            data0 = r0.json()
+            res0 = data0.get("optionChain", {}).get("result", [])
+            if res0:
+                exps = res0[0].get("expirationDates", [])
+                for exp_ts in exps[:8]:
+                    try:
+                        url = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={ticker}&date={exp_ts}"
+                        r = CFFI_SESSION.get(url, timeout=15)
+                        data = r.json()
+                        res = data.get("optionChain", {}).get("result", [])
+                        if not res:
+                            continue
+                        opts = res[0].get("options", [])
+                        if not opts:
+                            continue
+                        lst = opts[0].get("calls" if is_call else "puts", [])
+                        out = _parse_opt_list(lst, strike)
+                        if out:
+                            out["expiry"] = datetime.fromtimestamp(exp_ts, tz=NY).strftime("%Y-%m-%d")
+                            return out
+                    except Exception as e:
+                        print("opt cffi err", ticker, e)
                         continue
-                    opts = res[0].get("options", [])
-                    if not opts:
-                        continue
-                    lst = opts[0].get("calls" if is_call else "puts", [])
-                    r = _parse_opt_list(lst, strike)
-                    if r:
-                        r["expiry"] = datetime.fromtimestamp(exp_ts, tz=NY).strftime("%Y-%m-%d")
-                        return r
-                except Exception as e:
-                    print("opt direct err", ticker, e)
-                    continue
-    except Exception as e:
-        print("opt direct main err", ticker, e)
+        except Exception as e:
+            print("opt cffi main err", ticker, e)
 
-    # الطريقة 2: احتياط - yfinance
+    # الطريقة 2: yfinance احتياط - مع نفس الجلسة اذا توفرت
     try:
-        tk = yf.Ticker(ticker)
+        if CFFI_SESSION is not None:
+            tk = yf.Ticker(ticker, session=CFFI_SESSION)
+        else:
+            tk = yf.Ticker(ticker)
         exps = tk.options
         if not exps:
             return None
@@ -188,7 +198,6 @@ def analyze(ticker):
     avg_vol = float(np.mean(vols[-10:-1])) if len(vols) > 2 else 1
     vol_ratio = float(vols[-1] / avg_vol) if avg_vol > 0 else 0
 
-    # التعديل الجديد: mom15 بين -0.10% و +0.10% يعتبر محايد، نتبع mom1h
     if -0.10 <= mom15 <= 0.10:
         is_up = mom1h > 0
         is_down = mom1h < 0
