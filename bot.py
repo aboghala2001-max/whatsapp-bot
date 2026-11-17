@@ -58,6 +58,9 @@ def get_candles(ticker):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna()
+        # اخر شمعة مغلقة فقط - نحذف الشمعة الحالية اللي لسه مفتوحة
+        if len(df) > 1:
+            df = df.iloc[:-1]
         return df
     except Exception as e:
         print("candles err", ticker, e)
@@ -125,6 +128,8 @@ def analyze(ticker):
     highs = df["High"].values
     lows = df["Low"].values
     vols = df["Volume"].values
+    # وقت اغلاق اخر شمعة مغلقة
+    last_closed_time = df.index[-1]
 
     c0 = float(closes[-1])
     c1 = float(closes[-2])
@@ -198,25 +203,38 @@ def analyze(ticker):
         tp2 = round(entry * 2.0, 2)
         sl = round(entry * 0.7, 2)
         dur = "30 د - ساعة"
+        dur_min = 60
         prob = 78
     elif level == "متوسطة":
         tp1 = round(entry * 1.5, 2)
         tp2 = round(entry * 2.0, 2)
         sl = round(entry * 0.7, 2)
         dur = "15 - 30 د"
+        dur_min = 30
         prob = 65
     else:
         tp1 = round(entry * 1.3, 2)
         tp2 = round(entry * 1.6, 2)
         sl = round(entry * 0.75, 2)
         dur = "15 د"
+        dur_min = 15
         prob = 52
+
+    # مدة الفرصة - من وقت اغلاق الشمعة
+    now_ny = datetime.now(NY)
+    try:
+        closed_ny = last_closed_time.tz_convert(NY) if hasattr(last_closed_time, 'tz_convert') else last_closed_time
+        closed_str = closed_ny.strftime("%H:%M")
+    except:
+        closed_str = ""
+    expire_time = (now_ny + timedelta(minutes=dur_min)).strftime("%H:%M")
 
     data = {
         "ticker": ticker, "direction": direction, "level": level, "score": score,
         "price": round(c0, 2), "strike": opt["strike"], "entry": entry,
         "bid": opt["bid"], "ask": opt["ask"], "tp1": tp1, "tp2": tp2, "sl": sl,
         "contract": round(contract_price, 0), "prob": prob, "dur": dur,
+        "dur_min": dur_min, "expire_time": expire_time, "closed_str": closed_str,
         "mom15": round(mom15, 3), "mom1h": round(mom1h, 3), "rsi": round(rsi, 0),
         "vwap": round(vwap, 2), "vol": round(vol_ratio, 2),
         "vol_opt": opt["vol"], "oi": opt["oi"], "expiry": used_expiry
@@ -229,7 +247,7 @@ def format_msg(d):
     lvl = "🔥 قوية" if d["level"] == "قوية" else ("⚡ متوسطة" if d["level"] == "متوسطة" else "💡 خفيفة")
     return (
         f"{emoji} {d['ticker']} - {d['direction']} - {lvl} {d['score']}/10\n"
-        f"سعر السهم: {d['price']}$\n"
+        f"سعر السهم: {d['price']}$ (اخر شمعة مغلقة 15د: {d['closed_str']} بتوقيت نيويورك)\n"
         f"سترايك: {d['strike']}\n"
         f"انتهاء: {d['expiry']}\n"
         f"دخول: {d['entry']}$ | Bid {d['bid']} / Ask {d['ask']}\n"
@@ -237,7 +255,8 @@ def format_msg(d):
         f"هدف اول: {d['tp1']}$ (+50%)\n"
         f"هدف ثاني: {d['tp2']}$ (+100%)\n"
         f"وقف: {d['sl']}$ (-30%)\n"
-        f"المدة: {d['dur']} | الاحتمال: {d['prob']}%\n"
+        f"⏳ مدة الفرصة: {d['dur']} | تنتهي الساعة {d['expire_time']} بتوقيت نيويورك\n"
+        f"الاحتمال: {d['prob']}%\n"
         f"mom15 {d['mom15']}% | mom1h {d['mom1h']}% | RSI {d['rsi']} | VWAP {d['vwap']}\n"
         f"فوليوم اوبشن: {d['vol_opt']} | OI: {d['oi']}"
     )
