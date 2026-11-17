@@ -94,8 +94,11 @@ def get_real_option_info(tr):
         ask = safe_float(r.get('ask', 0))
         last = safe_float(r.get('lastPrice', 0))
         if bid > 0 and ask > 0:
-            price = (bid + ask) / 2
-            spread = (ask - bid) / price if price > 0 else 1
+            price = bid * 0.5 + ask * 0.5
+            spread = 0
+            if price > 0:
+                spread = ask - bid
+                spread = spread / price
             return {"price": price, "bid": bid, "ask": ask, "spread": spread, "source": "BID/ASK"}
         if last > 0:
             return {"price": last, "bid": bid, "ask": ask, "spread": 0, "source": "LAST"}
@@ -131,21 +134,18 @@ def check_signal(ticker):
         direction = None
         strength = None
         score = 0
-        # --- القوية: لازم كل الشروط ---
         if mom15>0.25 and mom1h>0.4 and rsi>55 and c0>vwap and vol_ratio>1.2:
             direction="CALL"
             score+=3
         elif mom15<-0.25 and mom1h<-0.4 and rsi<45 and c0<vwap and vol_ratio>1.2:
             direction="PUT"
             score+=3
-        # --- المتوسطة: زخم + RSI فقط ---
         elif mom15>0.15 and mom1h>0.2 and rsi>52:
             direction="CALL"
             score+=2
         elif mom15<-0.15 and mom1h<-0.2 and rsi<48:
             direction="PUT"
             score+=2
-        # --- الخفيفة: زخم فقط، بدون RSI ولا VWAP ولا فوليوم ---
         elif abs(mom15)>0.03:
             direction="CALL" if mom15>0 else "PUT"
             score+=1
@@ -191,4 +191,8 @@ def check_signal(ticker):
                 ask = safe_float(row.iloc[0].get('ask', 0))
                 last = safe_float(row.iloc[0].get('lastPrice', 0))
                 if bid > 0 and ask > 0:
-                    entry = (bid
+                    entry = bid * 0.5 + ask * 0.5
+                    price_source = "BID/ASK"
+                    spread = 0
+                    if entry > 0:
+                        spread
