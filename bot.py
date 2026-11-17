@@ -14,7 +14,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 TICKERS = ["AAPL","MSFT","NVDA","TSLA","META","AMZN","GOOGL","AMD","NFLX","AVGO",
 "PLTR","COIN","HOOD","SOFI","MSTR","APP","SMCI","ARM","MU","TSM",
 "JPM","XOM","BAC","WMT","COST","LLY","UNH","MA","V","CRM",
-"SPY","QQQ","XSP","DIA","IWM","GLD"]
+"SPY","QQQ","DIA","IWM","GLD"]
 
 LAST_DEBUG = {}
 SENT_TODAY = {"strong_mid": 0, "light": 0, "date": ""}
@@ -320,6 +320,7 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ تم المسح")
 
 async def post_init(app):
+    await app.bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(scanner(app))
 
 def main():
@@ -330,7 +331,7 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     print("Bot started")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
