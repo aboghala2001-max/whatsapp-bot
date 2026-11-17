@@ -1,6 +1,7 @@
 import os
 import time
 import asyncio
+import threading
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -8,6 +9,20 @@ from datetime import datetime, timedelta
 import pytz
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# --- باب وهمي عشان Render يسكت ---
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"Bot is running")
+    def log_message(self, *a): pass
+
+def keep_alive():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
+
+threading.Thread(target=keep_alive, daemon=True).start()
+# --- نهاية الباب الوهمي ---
 
 TOKEN = os.getenv("BOT_TOKEN")
 
