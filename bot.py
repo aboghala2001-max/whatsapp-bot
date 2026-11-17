@@ -114,8 +114,8 @@ def check_signal(ticker):
         vol = df['Volume']
         c0 = float(close.iloc[-1])
         c1 = float(close.iloc[-2])
-        if c0 > 2000:
-            LAST_DEBUG[ticker] = "السعر فوق 2000"
+        if c0 > 250:
+            LAST_DEBUG[ticker] = "السعر فوق 250$ - مرفوض"
             return None, None
         mom15 = (c0-c1)/c1*100
         mom1h = (c0-float(close.iloc[-5]))/float(close.iloc[-5])*100 if len(close)>=5 else 0
@@ -157,6 +157,7 @@ def check_signal(ticker):
         else:
             duration = "30 د"
         tk = yf.Ticker(ticker)
+        expiry = ny_today().isoformat()
         try:
             exps = tk.options
             today_str = ny_today().isoformat()
@@ -164,10 +165,8 @@ def check_signal(ticker):
                 expiry = today_str
             elif len(exps) > 0:
                 expiry = exps[0]
-            else:
-                return None, None
         except:
-            return None, None
+            pass
         strike = round(c0)
         entry = 2.5 if strength=="قوية" else 2.0
         bid = 0
@@ -216,7 +215,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_CHAT_ID
     AUTO_CHAT_ID = update.effective_chat.id
     check_daily_reset()
-    await update.message.reply_text("تم تشغيل المسح التلقائي")
+    await update.message.reply_text("تم تشغيل المسح التلقائي - يبدأ 9:00 قبل السوق بنص الساعة - ينتهي 4:00 مع الاغلاق - قوية + متوسطة كل دقيقتين - خفيفة كل 15 دقيقة - فرص اليومية فقط - سعر تحت 250$")
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("اكتب: /s META")
