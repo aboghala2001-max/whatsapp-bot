@@ -11,7 +11,6 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# --- باب وهمي عشان Render يسكت ---
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b"Bot is running")
@@ -22,7 +21,6 @@ def keep_alive():
     HTTPServer(("0.0.0.0", port), H).serve_forever()
 
 threading.Thread(target=keep_alive, daemon=True).start()
-# --- نهاية الباب الوهمي ---
 
 TOKEN = os.getenv("BOT_TOKEN")
 
@@ -58,7 +56,6 @@ def get_candles(ticker):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna()
-        # اخر شمعة مغلقة فقط - نحذف الشمعة الحالية اللي لسه مفتوحة
         if len(df) > 1:
             df = df.iloc[:-1]
         return df
@@ -66,7 +63,95 @@ def get_candles(ticker):
         print("candles err", ticker, e)
         return None
 
-def get_option_price(ticker, strike, is_call):
+def _to_float(x):
+    try:
+        if x is None or x == "" or x == "--":
+            return 0.0
+        if isinstance(x, str):
+            x = x.replace("$","").replace(",","").strip()
+        return float(x)
+    except:
+        return 0.0
+
+def _to_int(x):
+    try:
+        if x is None or x == "" or x == "--":
+            return 0
+        if isinstance(x, str):
+            x = x.replace(",","").strip()
+        return int(float(x))
+    except:
+        return 0
+
+def _parse_one(bid, ask, last, vol, oi, strike, expiry):
+    bid = _to_float(bid); ask = _to_float(ask); last = _to_float(last)
+    price = (bid + ask) / 2 if bid > 0 and ask > 0 else (last if last > 0 else ask)
+    if price <= 0:
+        return None
+    return {
+        "entry": round(price, 2),
+        "bid": round(bid, 2),
+        "ask": round(ask, 2),
+        "strike": float(strike),
+        "vol": _to_int(vol),
+        "oi": _to_int(oi),
+        "expiry": str(expiry),
+    }
+
+def get_option_price_nasdaq(ticker, strike, is_call):
+    import urllib.request, json, urllib.parse
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"https://www.nasdaq.com/market-activity/stocks/{ticker.lower()}/option-chain",
+        }
+        # نجيب اول 3 انتهاءات بس عشان ما ننحظر
+        url = f"https://api.nasdaq.com/api/quote/{ticker}/option-chain?assetclass=stock&limit=9999"
+        req = urllib.request.Request(url, headers=headers)
+        data = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        rows = data.get("data", {}).get("table", {}).get("rows", [])
+        if not rows:
+            print("nasdaq no rows", ticker)
+            return None
+        # نجمع حسب الانتهاء
+        by_exp = {}
+        for r in rows:
+            exp = r.get("expiryDate") or r.get("expirydate") or ""
+            if exp not in by_exp:
+                by_exp[exp] = []
+            by_exp[exp].append(r)
+        # اول 3 انتهاءات
+        for exp in list(by_exp.keys())[:3]:
+            best = None
+            best_diff = 999999
+            for r in by_exp[exp]:
+                try:
+                    s = _to_float(r.get("strike"))
+                except:
+                    continue
+                diff = abs(s - strike)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = r
+            if not best:
+                continue
+            # Nasdaq يرجع call/put كـ dict او كـ حقول مسطحة
+            side = best.get("call") if is_call else best.get("put")
+            if isinstance(side, dict):
+                res = _parse_one(side.get("bid"), side.get("ask"), side.get("last"), side.get("volume"), side.get("openInterest"), best.get("strike"), exp)
+            else:
+                # حقول مسطحة: c_Bid / p_Bid
+                prefix = "c_" if is_call else "p_"
+                res = _parse_one(best.get(prefix+"Bid"), best.get(prefix+"Ask"), best.get(prefix+"Last"), best.get(prefix+"Volume"), best.get(prefix+"openInterest"), best.get("strike"), exp)
+            if res:
+                return res
+        return None
+    except Exception as e:
+        print("nasdaq err", ticker, e)
+        return None
+
+def get_option_price_yahoo(ticker, strike, is_call):
     import urllib.request, json
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -77,8 +162,6 @@ def get_option_price(ticker, strike, is_call):
         if not res0:
             return None
         exps = res0[0].get("expirationDates", [])
-        if not exps:
-            return None
         for exp_ts in exps[:4]:
             try:
                 url = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={ticker}&date={exp_ts}"
@@ -94,28 +177,46 @@ def get_option_price(ticker, strike, is_call):
                 if not lst:
                     continue
                 best = min(lst, key=lambda x: abs(float(x.get("strike", 0)) - strike))
-                bid = float(best.get("bid", 0) or 0)
-                ask = float(best.get("ask", 0) or 0)
-                last = float(best.get("lastPrice", 0) or 0)
-                price = (bid + ask) / 2 if bid > 0 and ask > 0 else (last if last > 0 else ask)
-                if price <= 0:
-                    continue
-                return {
-                    "entry": round(price, 2),
-                    "bid": round(bid, 2),
-                    "ask": round(ask, 2),
-                    "strike": float(best["strike"]),
-                    "vol": int(best.get("volume", 0) or 0),
-                    "oi": int(best.get("openInterest", 0) or 0),
-                    "expiry": datetime.fromtimestamp(exp_ts, tz=NY).strftime("%Y-%m-%d"),
-                }
-            except Exception as e:
-                print("opt direct err", ticker, e)
+                res2 = _parse_one(best.get("bid"), best.get("ask"), best.get("lastPrice"), best.get("volume"), best.get("openInterest"), best.get("strike"), datetime.fromtimestamp(exp_ts, tz=NY).strftime("%Y-%m-%d"))
+                if res2:
+                    return res2
+            except:
                 continue
         return None
     except Exception as e:
-        print("opt err", ticker, e)
+        print("yahoo opt err", ticker, e)
         return None
+
+def get_option_price(ticker, strike, is_call):
+    # 1 - Nasdaq الاساسي
+    r = get_option_price_nasdaq(ticker, strike, is_call)
+    if r:
+        return r
+    # 2 - Yahoo احتياط
+    r = get_option_price_yahoo(ticker, strike, is_call)
+    if r:
+        return r
+    # 3 - yfinance احتياط اخير
+    try:
+        tk = yf.Ticker(ticker)
+        exps = tk.options
+        for exp in exps[:4]:
+            try:
+                chain = tk.option_chain(exp)
+                df = chain.calls if is_call else chain.puts
+                if df is None or df.empty:
+                    continue
+                df = df.copy()
+                df["diff"] = (df["strike"] - strike).abs()
+                row = df.sort_values("diff").iloc[0]
+                res = _parse_one(row.get("bid"), row.get("ask"), row.get("lastPrice"), row.get("volume"), row.get("openInterest"), row.get("strike"), exp)
+                if res:
+                    return res
+            except:
+                continue
+    except Exception as e:
+        print("opt err", ticker, e)
+    return None
 
 def analyze(ticker):
     reset_daily()
@@ -128,7 +229,6 @@ def analyze(ticker):
     highs = df["High"].values
     lows = df["Low"].values
     vols = df["Volume"].values
-    # وقت اغلاق اخر شمعة مغلقة
     last_closed_time = df.index[-1]
 
     c0 = float(closes[-1])
@@ -185,7 +285,7 @@ def analyze(ticker):
 
     opt = get_option_price(ticker, strike, direction == "CALL")
     if opt is None:
-        LAST_DEBUG[ticker] = f"سعر {c0:.2f} | ما فيه اوبشن للسترايك {strike}"
+        LAST_DEBUG[ticker] = f"سعر {c0:.2f} | Nasdaq + Yahoo ما ردوا على الأوبشن - حاول بعد دقيقة"
         return None
     used_expiry = opt["expiry"]
 
@@ -220,7 +320,6 @@ def analyze(ticker):
         dur_min = 15
         prob = 52
 
-    # مدة الفرصة - من وقت اغلاق الشمعة
     now_ny = datetime.now(NY)
     try:
         closed_ny = last_closed_time.tz_convert(NY) if hasattr(last_closed_time, 'tz_convert') else last_closed_time
@@ -306,16 +405,7 @@ async def scanner(app):
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
     reset_daily()
-    await update.message.reply_text(
-        "✅ البوت شغال\n"
-        "قوية + متوسطة 10 في اليوم - خفيفة 5 في اليوم\n"
-        "فلتر: سعر العقد تحت 250$ (سعر السهم ما له فلتر)\n"
-        "الاوامر:\n"
-        "/best - افضل الفرص الحين\n"
-        "/s NVDA - فحص شركة\n"
-        "/status - حالة اليوم\n"
-        "/clear - مسح المتابعة"
-    )
+    await update.message.reply_text("✅ البوت شغال\nقوية + متوسطة 10 في اليوم - خفيفة 5 في اليوم\nفلتر: سعر العقد تحت 250$\nالاوامر:\n/best - افضل الفرص الحين\n/s NVDA - فحص شركة\n/status - حالة اليوم\n/clear - مسح المتابعة")
 
 async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
