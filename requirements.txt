@@ -1,7 +1,6 @@
-Flask
+python-telegram-bot
 yfinance
 pandas
 numpy
-python-telegram-bot[job-queue]
-requests
 pytz
+curl_cffi
