@@ -1,6 +1,6 @@
 import os
 import time
-import threading
+import asyncio
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -17,13 +17,12 @@ TICKERS = ["AAPL","MSFT","NVDA","TSLA","META","AMZN","GOOGL","AMD","NFLX","AVGO"
 "SPY","QQQ","XSP","DIA","IWM","GLD"]
 
 LAST_DEBUG = {}
-SENT_TODAY = {"strong_mid":0, "light":0, "date":""}
-ACTIVE = {}  # ticker -> {dir, entry, tp1, tp2, sl, expiry}
+SENT_TODAY = {"strong_mid": 0, "light": 0, "date": ""}
+ACTIVE = {}
 CHAT_IDS = set()
 LAST_LIGHT_SENT = 0
 
 NY = pytz.timezone("America/New_York")
-RIYADH = pytz.timezone("Asia/Riyadh")
 
 def today_str():
     return datetime.now(NY).strftime("%Y-%m-%d")
@@ -31,7 +30,9 @@ def today_str():
 def reset_daily():
     d = today_str()
     if SENT_TODAY["date"] != d:
-        SENT_TODAY.update({"strong_mid":0, "light":0, "date":d})
+        SENT_TODAY["strong_mid"] = 0
+        SENT_TODAY["light"] = 0
+        SENT_TODAY["date"] = d
         ACTIVE.clear()
 
 def get_candles(ticker):
@@ -43,7 +44,8 @@ def get_candles(ticker):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna()
         return df
-    except:
+    except Exception as e:
+        print("candles err", ticker, e)
         return None
 
 def get_option_price(ticker, strike, is_call, expiry):
@@ -51,7 +53,7 @@ def get_option_price(ticker, strike, is_call, expiry):
         tk = yf.Ticker(ticker)
         chain = tk.option_chain(expiry)
         opts = chain.calls if is_call else chain.puts
-        if opts.empty:
+        if opts is None or opts.empty:
             return None
         opts = opts.copy()
         opts["diff"] = abs(opts["strike"] - strike)
@@ -68,8 +70,16 @@ def get_option_price(ticker, strike, is_call, expiry):
             price = ask
         else:
             return None
-        return {"entry": round(price, 2), "bid": round(bid, 2), "ask": round(ask, 2), "strike": float(row["strike"]), "vol": int(row.get("volume", 0) or 0), "oi": int(row.get("openInterest", 0) or 0)}
-    except:
+        return {
+            "entry": round(price, 2),
+            "bid": round(bid, 2),
+            "ask": round(ask, 2),
+            "strike": float(row["strike"]),
+            "vol": int(row.get("volume", 0) or 0),
+            "oi": int(row.get("openInterest", 0) or 0),
+        }
+    except Exception as e:
+        print("opt err", ticker, e)
         return None
 
 def analyze(ticker):
@@ -77,7 +87,7 @@ def analyze(ticker):
     df = get_candles(ticker)
     if df is None or len(df) < 10:
         LAST_DEBUG[ticker] = "ما فيه بيانات"
-        return None, None
+        return None
 
     closes = df["Close"].values
     highs = df["High"].values
@@ -86,12 +96,10 @@ def analyze(ticker):
 
     c0 = float(closes[-1])
     c1 = float(closes[-2])
-    # 15m = آخر شمعة، 1h = آخر 4 شموع
     mom15 = (c0 / c1 - 1) * 100 if c1 else 0
     c_1h = float(closes[-5]) if len(closes) >= 5 else c1
     mom1h = (c0 / c_1h - 1) * 100 if c_1h else 0
 
-    # RSI 14 على 15m
     deltas = np.diff(closes[-15:])
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
@@ -103,106 +111,91 @@ def analyze(ticker):
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
 
-    # VWAP تقريبي آخر 20 شمعة
     tp = (highs[-20:] + lows[-20:] + closes[-20:]) / 3
     vwap = float(np.sum(tp * vols[-20:]) / np.sum(vols[-20:])) if np.sum(vols[-20:]) > 0 else c0
     above_vwap = c0 > vwap
-
-    # حجم آخر شمعة مقابل المتوسط
     avg_vol = float(np.mean(vols[-10:-1])) if len(vols) > 2 else 1
     vol_ratio = float(vols[-1] / avg_vol) if avg_vol > 0 else 0
 
-    direction = None
-    level = None
-    score = 0
-
-    # تحديد الاتجاه
     is_up = mom15 > 0 and mom1h > 0
     is_down = mom15 < 0 and mom1h < 0
 
     if not is_up and not is_down:
         LAST_DEBUG[ticker] = f"سعر {c0:.2f} | mom15 {mom15:.3f}% | mom1h {mom1h:.3f}% | RSI {rsi:.0f} | فوليوم {vol_ratio:.2f}x | اتجاه متعاكس - لا"
-        return None, None
+        return None
 
     direction = "CALL" if is_up else "PUT"
     amom15 = abs(mom15)
     amom1h = abs(mom1h)
 
-    # قوية
     if amom15 >= 0.25 and amom1h >= 0.4 and ((is_up and rsi >= 55 and above_vwap) or (is_down and rsi <= 45 and not above_vwap)):
         level = "قوية"
         score = 10
-    # متوسطة
     elif amom15 >= 0.15 and amom1h >= 0.2 and ((is_up and rsi >= 52) or (is_down and rsi <= 48)):
         level = "متوسطة"
         score = 7
-    # خفيفة
     elif amom15 >= 0.01:
         level = "خفيفة"
         score = 4
     else:
         LAST_DEBUG[ticker] = f"سعر {c0:.2f} | mom15 {mom15:.3f}% | mom1h {mom1h:.3f}% | RSI {rsi:.0f} | حركة ضعيفة - لا"
-        return None, None
+        return None
 
-    # حساب السترايك
     if direction == "CALL":
         strike = float(np.ceil(c0)) if c0 < 100 else float(np.ceil(c0 / 5) * 5)
     else:
         strike = float(np.floor(c0)) if c0 < 100 else float(np.floor(c0 / 5) * 5)
 
-    # تاريخ الانتهاء: أقرب جمعة
     now_ny = datetime.now(NY)
     days_to_fri = (4 - now_ny.weekday()) % 7
     if days_to_fri == 0 and now_ny.hour >= 16:
         days_to_fri = 7
     expiry_date = (now_ny + timedelta(days=days_to_fri)).date()
     expiry_str = expiry_date.strftime("%Y-%m-%d")
+    expiry_show = expiry_date.strftime("%d-%m-%Y")
 
     opt = get_option_price(ticker, strike, direction == "CALL", expiry_str)
+    used_expiry = expiry_show
     if opt is None:
-        # جرب انتهاء ثاني
         try:
             tk = yf.Ticker(ticker)
             exps = tk.options
             if exps:
                 opt = get_option_price(ticker, strike, direction == "CALL", exps[0])
+                used_expiry = exps[0]
         except:
             pass
     if opt is None:
-        LAST_DEBUG[ticker] = f"سعر {c0:.2f} | ما فيه أوبشن للسترايك {strike}"
-        return None, None
+        LAST_DEBUG[ticker] = f"سعر {c0:.2f} | ما فيه اوبشن للسترايك {strike}"
+        return None
 
     entry = opt["entry"]
     if entry <= 0 or pd.isna(entry):
         entry = 2.0
 
-    # === فلتر سعر العقد - الصح ===
-    # سعر العقد = سعر الأوبشن × 100، لازم يكون تحت 250$
-    # سعر السهم ما له فلتر، يدخل لو كان 1000$
     contract_price = entry * 100
     if contract_price > 250:
         LAST_DEBUG[ticker] = f"سعر السهم {c0:.2f} | سعر العقد {contract_price:.0f}$ - فوق 250$ - مرفوض"
-        return None, None
+        return None
 
-    # الأهداف
     if level == "قوية":
         tp1 = round(entry * 1.5, 2)
         tp2 = round(entry * 2.0, 2)
         sl = round(entry * 0.7, 2)
         dur = "30 د - ساعة"
+        prob = 78
     elif level == "متوسطة":
         tp1 = round(entry * 1.5, 2)
         tp2 = round(entry * 2.0, 2)
         sl = round(entry * 0.7, 2)
         dur = "15 - 30 د"
+        prob = 65
     else:
         tp1 = round(entry * 1.3, 2)
         tp2 = round(entry * 1.6, 2)
         sl = round(entry * 0.75, 2)
         dur = "15 د"
-
-    # احتمال تقريبي
-    prob = 78 if level == "قوية" else (65 if level == "متوسطة" else 52)
+        prob = 52
 
     data = {
         "ticker": ticker, "direction": direction, "level": level, "score": score,
@@ -211,10 +204,10 @@ def analyze(ticker):
         "contract": round(contract_price, 0), "prob": prob, "dur": dur,
         "mom15": round(mom15, 3), "mom1h": round(mom1h, 3), "rsi": round(rsi, 0),
         "vwap": round(vwap, 2), "vol": round(vol_ratio, 2),
-        "vol_opt": opt["vol"], "oi": opt["oi"]
+        "vol_opt": opt["vol"], "oi": opt["oi"], "expiry": used_expiry
     }
     LAST_DEBUG[ticker] = f"سعر {c0:.2f} | عقد {contract_price:.0f}$ | mom15 {mom15:.3f}% | mom1h {mom1h:.3f}% | RSI {rsi:.0f} | {level} {direction}"
-    return data, data
+    return data
 
 def format_msg(d):
     emoji = "🟢" if d["direction"] == "CALL" else "🔴"
@@ -223,32 +216,33 @@ def format_msg(d):
         f"{emoji} {d['ticker']} - {d['direction']} - {lvl} {d['score']}/10\n"
         f"سعر السهم: {d['price']}$\n"
         f"سترايك: {d['strike']}\n"
+        f"انتهاء: {d['expiry']}\n"
         f"دخول: {d['entry']}$ | Bid {d['bid']} / Ask {d['ask']}\n"
         f"سعر العقد: {d['contract']}$\n"
-        f"هدف أول: {d['tp1']}$ (+50%)\n"
+        f"هدف اول: {d['tp1']}$ (+50%)\n"
         f"هدف ثاني: {d['tp2']}$ (+100%)\n"
         f"وقف: {d['sl']}$ (-30%)\n"
         f"المدة: {d['dur']} | الاحتمال: {d['prob']}%\n"
         f"mom15 {d['mom15']}% | mom1h {d['mom1h']}% | RSI {d['rsi']} | VWAP {d['vwap']}\n"
-        f"فوليوم أوبشن: {d['vol_opt']} | OI: {d['oi']}"
+        f"فوليوم اوبشن: {d['vol_opt']} | OI: {d['oi']}"
     )
 
 async def send_all(app, text):
     for cid in list(CHAT_IDS):
         try:
             await app.bot.send_message(chat_id=cid, text=text)
-        except:
-            pass
+        except Exception as e:
+            print("send err", e)
 
 async def scanner(app):
+    global LAST_LIGHT_SENT
     while True:
         try:
             reset_daily()
             now_ny = datetime.now(NY)
-            # السوق 9:00 - 16:00 نيويورك، الاثنين - الجمعة
             if now_ny.weekday() < 5 and 9 <= now_ny.hour < 16:
                 for t in TICKERS:
-                    d, _ = analyze(t)
+                    d = analyze(t)
                     if not d:
                         continue
                     if d["ticker"] in ACTIVE:
@@ -260,35 +254,20 @@ async def scanner(app):
                     else:
                         if SENT_TODAY["light"] >= 5:
                             continue
-                        if time.time() - LAST_LIGHT_SENT < 900:  # 15 دقيقة بين الخفيفة
+                        if time.time() - LAST_LIGHT_SENT < 900:
                             continue
-                        global LAST_LIGHT_SENT
                         LAST_LIGHT_SENT = time.time()
                         SENT_TODAY["light"] += 1
                     ACTIVE[d["ticker"]] = d
                     await send_all(app, format_msg(d))
-                    await send_all(app, f"تابع {d['ticker']} - راح أبلغك بالهدف أو الوقف")
-                # متابعة الصفقات النشطة
-                for t in list(ACTIVE.keys()):
-                    d = ACTIVE[t]
-                    # فحص سعر الأوبشن الحالي
-                    df = get_candles(t)
-                    if df is None:
-                        continue
-                    # تبسيط: نفحص سعر السهم فقط للتنبيه
-                    # لو الساعة 16:00 أغلق الكل
-                    if now_ny.hour >= 16:
-                        await send_all(app, f"⏰ إغلاق السوق - {t} انتهت المتابعة")
-                        del ACTIVE[t]
-            # ملخص 16:05
+                if now_ny.hour >= 16:
+                    ACTIVE.clear()
             if now_ny.weekday() < 5 and now_ny.hour == 16 and now_ny.minute == 5:
                 await send_all(app, f"📊 ملخص اليوم: قوية+متوسطة {SENT_TODAY['strong_mid']}/10 | خفيفة {SENT_TODAY['light']}/5")
                 await asyncio.sleep(60)
         except Exception as e:
             print("scanner error", e)
         await asyncio.sleep(120)
-
-import asyncio
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
@@ -297,8 +276,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ البوت شغال\n"
         "قوية + متوسطة 10 في اليوم - خفيفة 5 في اليوم\n"
         "فلتر: سعر العقد تحت 250$ (سعر السهم ما له فلتر)\n"
-        "الأوامر:\n"
-        "/best - أفضل الفرص الحين\n"
+        "الاوامر:\n"
+        "/best - افضل الفرص الحين\n"
         "/s NVDA - فحص شركة\n"
         "/status - حالة اليوم\n"
         "/clear - مسح المتابعة"
@@ -306,16 +285,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
-    await update.message.reply_text("🔍 أفحص كل الشركات...")
+    await update.message.reply_text("🔍 افحص كل الشركات...")
     results = []
     for t in TICKERS:
-        d, _ = analyze(t)
+        d = analyze(t)
         if d:
             results.append(d)
     if not results:
-        await update.message.reply_text("ما فيه فرص الحين - السوق هادي أو كل الفرص مرفوضة بفلتر العقد")
+        await update.message.reply_text("ما فيه فرص الحين - السوق هادي او كل الفرص مرفوضة بفلتر العقد")
         return
-    # ترتيب: قوية أول
     order = {"قوية": 0, "متوسطة": 1, "خفيفة": 2}
     results.sort(key=lambda x: order.get(x["level"], 3))
     for d in results[:10]:
@@ -327,7 +305,7 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اكتب: /s NVDA")
         return
     t = context.args[0].upper()
-    d, _ = analyze(t)
+    d = analyze(t)
     if d:
         await update.message.reply_text(format_msg(d))
     else:
@@ -341,17 +319,16 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ACTIVE.clear()
     await update.message.reply_text("✅ تم المسح")
 
+async def post_init(app):
+    asyncio.create_task(scanner(app))
+
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_handler(CommandHandler("s", s_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
-    # تشغيل السكانر في الخلفية
-    async def on_startup(app):
-        asyncio.create_task(scanner(app))
-    app.post_init = on_startup
     print("Bot started")
     app.run_polling()
 
