@@ -25,6 +25,7 @@ SUMMARY_SENT_DATE = None
 LAST_RESET_DATE = None
 MARKET_CACHE = {}
 CACHE_TIME = 0
+LAST_DEBUG = {}
 app = Flask(__name__)
 @app.route("/")
 def home():
@@ -101,9 +102,11 @@ def get_option_price(tr):
         return None
     return float(info['price'])
 def check_signal(ticker):
+    global LAST_DEBUG
     try:
         df = yf.download(ticker, period="2d", interval="15m", progress=False, auto_adjust=True)
         if df is None or len(df) < 20:
+            LAST_DEBUG[ticker] = "ما فيه بيانات"
             return None, None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -112,6 +115,7 @@ def check_signal(ticker):
         c0 = float(close.iloc[-1])
         c1 = float(close.iloc[-2])
         if c0 > 2000:
+            LAST_DEBUG[ticker] = "السعر فوق 2000"
             return None, None
         mom15 = (c0-c1)/c1*100
         mom1h = (c0-float(close.iloc[-5]))/float(close.iloc[-5])*100 if len(close)>=5 else 0
@@ -119,6 +123,7 @@ def check_signal(ticker):
         vwap = float((close*vol).cumsum().iloc[-1] / (vol.cumsum().iloc[-1]+1e-9))
         avg_vol = float(vol.iloc[-20:-1].mean())
         vol_ratio = float(vol.iloc[-1]/(avg_vol+1e-9))
+        LAST_DEBUG[ticker] = "سعر " + format(c0, ".2f") + " | mom15 " + format(mom15, ".3f") + "% | mom1h " + format(mom1h, ".3f") + "% | RSI " + format(rsi, ".0f") + " | فوق VWAP " + ("نعم" if c0>vwap else "لا") + " | فوليوم " + format(vol_ratio, ".2f") + "x"
         direction = None
         strength = None
         score = 0
@@ -134,7 +139,7 @@ def check_signal(ticker):
         elif mom15<-0.15 and mom1h<-0.2 and rsi<48:
             direction="PUT"
             score+=2
-        elif abs(mom15)>0.03:
+        elif abs(mom15)>0.01:
             direction="CALL" if mom15>0 else "PUT"
             score+=1
         else:
@@ -168,6 +173,7 @@ def check_signal(ticker):
         bid = 0
         ask = 0
         price_source = "LAST"
+        spread_pct = 0
         try:
             oc = tk.option_chain(expiry)
             chain = oc.calls if direction=="CALL" else oc.puts
@@ -181,13 +187,8 @@ def check_signal(ticker):
                 if bid > 0 and ask > 0:
                     entry = bid * 0.5 + ask * 0.5
                     price_source = "BID/ASK"
-                    spread = 0
                     if entry > 0:
-                        spread = ask - bid
-                        spread = spread / entry
-                    max_spread = 0.30 if strength=="خفيفة" else 0.20
-                    if spread > max_spread:
-                        return None, None
+                        spread_pct = (ask - bid) / entry * 100
                 elif last > 0:
                     entry = last
                     price_source = "LAST"
@@ -203,10 +204,13 @@ def check_signal(ticker):
         if price_source == "LAST":
             price_line += " سعر قديم - تأكد من منصتك"
         else:
-            price_line += " سعر حقيقي Bid/Ask"
+            price_line += " سعر حقيقي Bid/Ask - سبريد " + format(spread_pct, ".0f") + "%"
+            if spread_pct > 30:
+                price_line += " - سبريد عالي انتبه"
         msg = NL.join(["فرصة " + strength + " " + direction + " " + ticker,"الشركة: " + ticker,"السترايك: " + str(int(strike)),price_line,"الهدف الاول: " + format(t1, ".2f") + "$ (+50%)","الهدف الثاني: " + format(t2, ".2f") + "$ (+100%)","الوقف: " + format(stop, ".2f") + "$ (-30%)","مدة الفرصة: " + duration,"انتهاء الخيار: " + str(expiry)])
         return trade, msg
-    except:
+    except Exception as e:
+        LAST_DEBUG[ticker] = "خطأ: " + str(e)
         return None, None
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global AUTO_CHAT_ID
@@ -220,7 +224,8 @@ async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = context.args[0].upper()
     trade, msg = check_signal(t)
     if not trade:
-        await update.message.reply_text("ما فيه فرصة قوية على " + t + " الحين")
+        dbg = LAST_DEBUG.get(t, "ما فيه بيانات")
+        await update.message.reply_text("ما فيه فرصة على " + t + " الحين" + NL + dbg)
     else:
         await update.message.reply_text(msg)
 async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
