@@ -64,42 +64,50 @@ def get_candles(ticker):
         return None
 
 def get_option_price(ticker, strike, is_call):
+    import urllib.request, json
     try:
-        tk = yf.Ticker(ticker)
-        exps = tk.options
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        url0 = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={ticker}"
+        req0 = urllib.request.Request(url0, headers=headers)
+        data0 = json.loads(urllib.request.urlopen(req0, timeout=15).read())
+        res0 = data0.get("optionChain", {}).get("result", [])
+        if not res0:
+            return None
+        exps = res0[0].get("expirationDates", [])
         if not exps:
             return None
-        for expiry in exps[:4]:
+        for exp_ts in exps[:4]:
             try:
-                chain = tk.option_chain(expiry)
-                opts = chain.calls if is_call else chain.puts
-                if opts is None or opts.empty:
+                url = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={ticker}&date={exp_ts}"
+                req = urllib.request.Request(url, headers=headers)
+                data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+                res = data.get("optionChain", {}).get("result", [])
+                if not res:
                     continue
-                opts = opts.copy()
-                opts["diff"] = abs(opts["strike"] - strike)
-                row = opts.sort_values("diff").iloc[0]
-                bid = float(row.get("bid", 0) or 0)
-                ask = float(row.get("ask", 0) or 0)
-                last = float(row.get("lastPrice", 0) or 0)
-                price = 0
-                if bid > 0 and ask > 0:
-                    price = (bid + ask) / 2
-                elif last > 0:
-                    price = last
-                elif ask > 0:
-                    price = ask
-                else:
+                opts = res[0].get("options", [])
+                if not opts:
+                    continue
+                lst = opts[0].get("calls" if is_call else "puts", [])
+                if not lst:
+                    continue
+                best = min(lst, key=lambda x: abs(float(x.get("strike", 0)) - strike))
+                bid = float(best.get("bid", 0) or 0)
+                ask = float(best.get("ask", 0) or 0)
+                last = float(best.get("lastPrice", 0) or 0)
+                price = (bid + ask) / 2 if bid > 0 and ask > 0 else (last if last > 0 else ask)
+                if price <= 0:
                     continue
                 return {
                     "entry": round(price, 2),
                     "bid": round(bid, 2),
                     "ask": round(ask, 2),
-                    "strike": float(row["strike"]),
-                    "vol": int(row.get("volume", 0) or 0),
-                    "oi": int(row.get("openInterest", 0) or 0),
-                    "expiry": expiry,
+                    "strike": float(best["strike"]),
+                    "vol": int(best.get("volume", 0) or 0),
+                    "oi": int(best.get("openInterest", 0) or 0),
+                    "expiry": datetime.fromtimestamp(exp_ts, tz=NY).strftime("%Y-%m-%d"),
                 }
-            except:
+            except Exception as e:
+                print("opt direct err", ticker, e)
                 continue
         return None
     except Exception as e:
