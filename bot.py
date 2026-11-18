@@ -19,13 +19,10 @@ TOKEN = os.getenv("BOT_TOKEN")
 SA = pytz.timezone("Asia/Riyadh")
 NY = pytz.timezone("America/New_York")
 
-# 2 - الشركات
 TICKERS = ["SPY","QQQ","IWM","INDX","NVDA","TSLA","META","AAPL","AMD","AMZN","MU"]
 INDX_MAP = {"INDX": {"candle": "^NDX", "option": "QQQ"}}
 
-# 9 - عدد الفرص 10
 MAX_PER_DAY = 10
-# 8 - عدم تكرار
 ACTIVE = {}
 HISTORY = []
 SENT_TODAY = 0
@@ -51,7 +48,6 @@ def reset_daily():
         ACTIVE.clear()
         HISTORY.clear()
 
-# 1 - فرص يومية فقط - 4 عصراً الى 12 صباحاً بتوقيت السعودية
 def in_session():
     now = datetime.now(SA)
     return 16 <= now.hour < 24
@@ -70,9 +66,6 @@ def get_candles(ticker, interval):
         return None
 
 def get_option_atm(ticker, price, is_call):
-    # 5 - عقود عالية المخاطر وسعرها ATM
-    # عالية المخاطر = اقرب انتهاء متاح
-    # ATM = اقرب سترايك لسعر السهم
     opt_sym = INDX_MAP.get(ticker, {}).get("option", ticker)
     strike = float(round(price))
     if CFFI is not None:
@@ -81,7 +74,7 @@ def get_option_atm(ticker, price, is_call):
             r0 = CFFI.get(url0, timeout=15).json()
             res0 = r0.get("optionChain", {}).get("result", [])
             if res0 and res0[0].get("expirationDates"):
-                exp_ts = res0[0]["expirationDates"][0]  # اقرب انتهاء فقط
+                exp_ts = res0[0]["expirationDates"][0]
                 url = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={opt_sym}&date={exp_ts}"
                 data = CFFI.get(url, timeout=15).json()
                 res = data.get("optionChain", {}).get("result", [])
@@ -95,8 +88,6 @@ def get_option_atm(ticker, price, is_call):
                             last = float(best.get("lastPrice",0) or 0)
                             mid = (bid+ask)/2 if bid>0 and ask>0 else last
                             if mid <= 0: return None
-                            # 6 - السبريد ضيق: لازم يكون فيه بيد وآسك، والسبريد موجود
-                            # بدون رقم من عندي - فقط نعرضه لك في الرسالة وانت تحكم
                             spread = ask - bid if bid>0 and ask>0 else 0
                             return {"entry": round(mid,2), "bid": round(bid,2), "ask": round(ask,2),
                                     "strike": float(best["strike"]),
@@ -108,17 +99,12 @@ def get_option_atm(ticker, price, is_call):
 
 def analyze(ticker):
     reset_daily()
-    # 7 - الشمعات من 5 دقايق الى 15 دقيقة
     df5 = get_candles(ticker, "5m")
     df15 = get_candles(ticker, "15m")
     if df5 is None or df5.empty or df15 is None or df15.empty:
         LAST_DEBUG[ticker] = "ما فيه بيانات"
         return None
 
-    # 3 - الكول اختراق قمة والثبات فوقها
-    # 4 - البوت اختراق قاع والثبات تحته
-    # التفسير الحرفي: الاغلاق الحالي فوق قمة الشمعة السابقة، وثابت فوقها في 5د و 15د
-    # بدون عدد شموع من عندي - الاغلاق نفسه هو الثبات
     c5 = float(df5["Close"].iloc[-1])
     h5_prev = float(df5["High"].iloc[-2])
     l5_prev = float(df5["Low"].iloc[-2])
@@ -127,9 +113,9 @@ def analyze(ticker):
     h15_prev = float(df15["High"].iloc[-2])
     l15_prev = float(df15["Low"].iloc[-2])
 
-    # لازم الاختراق يظهر في الفريمين 5د و 15د مع بعض - هذا هو شرط 7
-    is_call = c5 > h5_prev and c15 > h15_prev
-    is_put = c5 < l5_prev and c15 < l15_prev
+    # الشرط الجديد: 5د أو 15د يكفي
+    is_call = c5 > h5_prev or c15 > h15_prev
+    is_put = c5 < l5_prev or c15 < l15_prev
 
     if not is_call and not is_put:
         LAST_DEBUG[ticker] = f"سعر 5د {c5:.2f} | قمة {h5_prev:.2f} | قاع {l5_prev:.2f} | ما فيه اختراق"
@@ -146,11 +132,9 @@ def analyze(ticker):
         return None
 
     entry = opt["entry"]
-    # 11 - الهدف الاول 30% - الهدف الثاني 60% - الوقف 35%
     tp1 = round(entry * 1.30, 2)
     tp2 = round(entry * 1.60, 2)
     sl = round(entry * 0.65, 2)
-    # المدة = حتى نهاية الجلسة - بدون رقم 60 دقيقة من عندي
     dur = "حتى نهاية الجلسة"
 
     return {
@@ -164,7 +148,6 @@ def analyze(ticker):
 
 def format_msg(d):
     emoji = "🟢" if d["direction"] == "CALL" else "🔴"
-    # 11 - رسالة الفرصة
     return (
         f"🚨 تنبيه - {emoji} {d['ticker']} - {d['direction']}\n"
         f"الشركة: {d['ticker']} | السترايك: {d['strike']} | المدة: {d['dur']}\n"
@@ -185,7 +168,6 @@ async def send_all(app, text):
 async def check_active(app):
     for t, d in list(ACTIVE.items()):
         if d["status"] != "نشطة": continue
-        # تنتهي بنهاية الجلسة فقط - بدون 60 دقيقة
         if not in_session():
             d["status"] = "انتهت"; d["result"] = "انتهت الجلسة"; del ACTIVE[t]; continue
         opt = get_option_atm(t, d["price"], d["direction"] == "CALL")
@@ -207,7 +189,6 @@ async def scanner(app):
         try:
             reset_daily()
             now_sa = datetime.now(SA)
-            # 10 - تقييم الفرصة نهاية جلسة التداول مع نسبة نجاحها
             if now_sa.hour == 0 and now_sa.minute < 5 and not sent_summary and HISTORY:
                 total = len(HISTORY)
                 wins = sum(1 for h in HISTORY if "✅" in h["result"])
@@ -225,7 +206,7 @@ async def scanner(app):
                 await check_active(app)
                 for t in TICKERS:
                     if SENT_TODAY >= MAX_PER_DAY: break
-                    if t in ACTIVE: continue  # 8
+                    if t in ACTIVE: continue
                     d = analyze(t)
                     if not d: continue
                     ACTIVE[t] = d
