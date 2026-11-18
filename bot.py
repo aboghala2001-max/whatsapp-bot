@@ -1,8 +1,7 @@
 import os, time, asyncio, threading
 import yfinance as yf
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -23,20 +22,18 @@ NY = pytz.timezone("America/New_York")
 
 # شرط 2 - الشركات
 TICKERS = ["SPY","QQQ","IWM","INDX","NVDA","TSLA","META","AAPL","AMD","AMZN","MU"]
-# INDX = مؤشر، شموعه من NDX وعقده من QQQ
 INDX_MAP = {"INDX": {"candle": "^NDX", "option": "QQQ"}}
 
 # شرط 9 - 10 فرص
 MAX_PER_DAY = 10
 # شرط 8 - لا تكرار
-ACTIVE = {}  # ticker -> opportunity
-HISTORY = [] # كل فرص اليوم
+ACTIVE = {}
+HISTORY = []
 SENT_TODAY = 0
 TODAY = ""
 CHAT_IDS = set()
 LAST_DEBUG = {}
 
-# جلسة Yahoo بمتصفح حقيقي
 try:
     from curl_cffi import requests as cffi_requests
     CFFI = cffi_requests.Session(impersonate="chrome")
@@ -81,7 +78,6 @@ def get_option_atm(ticker, price, is_call):
     else:
         strike = float(round(price / 5) * 5)
 
-    # جلب العقد
     if CFFI is not None:
         try:
             url0 = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={opt_sym}"
@@ -117,22 +113,25 @@ def get_option_atm(ticker, price, is_call):
 
 def analyze(ticker):
     reset_daily()
+    # شرط 7 - شمعات 5د الى 15د
     df5 = get_candles(ticker, "5m")
     df15 = get_candles(ticker, "15m")
-    if df5 is None or len(df5) < 25 or df15 is None or len(df15) < 10:
+    if df5 is None or len(df5) < 3 or df15 is None or len(df15) < 3:
         LAST_DEBUG[ticker] = "ما فيه بيانات كافية"
         return None
 
     c0 = float(df5["Close"].iloc[-1])
-    c1 = float(df5["Close"].iloc[-2])
-    # قمة وقاع اخر 20 شمعة 5د = اخر 100 دقيقة
-    prev_high = float(df5["High"].iloc[-21:-1].max())
-    prev_low = float(df5["Low"].iloc[-21:-1].min())
+    # قمة وقاع الشمعة السابقة - هذا هو الاختراق
+    prev_high = float(df5["High"].iloc[-2])
+    prev_low = float(df5["Low"].iloc[-2])
+    # تأكيد بالـ 15د: اتجاه نفس الاتجاه
+    c15 = float(df15["Close"].iloc[-1])
+    o15 = float(df15["Open"].iloc[-1])
 
-    # شرط 3 + 4 - اختراق + ثبات
-    # الثبات = شمعتين مغلقات فوق القمة / تحت القاع
-    is_call = c0 > prev_high and c1 > prev_high
-    is_put = c0 < prev_low and c1 < prev_low
+    # شرط 3 - كول اختراق قمة والثبات فوقها
+    is_call = c0 > prev_high and c15 > o15
+    # شرط 4 - بوت اختراق قاع والثبات تحته
+    is_put = c0 < prev_low and c15 < o15
 
     if not is_call and not is_put:
         LAST_DEBUG[ticker] = f"سعر {c0:.2f} | قمة {prev_high:.2f} | قاع {prev_low:.2f} | ما فيه اختراق"
@@ -150,10 +149,9 @@ def analyze(ticker):
 
     entry = opt["entry"]
     # شرط 11 - اهداف ووقف
-    tp1 = round(entry * 1.30, 2)  # +30%
-    tp2 = round(entry * 1.60, 2)  # +60%
-    sl = round(entry * 0.65, 2)   # -35%
-    # مدة الفرصة - 60 دقيقة او لين نهاية الجلسة
+    tp1 = round(entry * 1.30, 2)
+    tp2 = round(entry * 1.60, 2)
+    sl = round(entry * 0.65, 2)
     dur = "60 دقيقة"
 
     return {
@@ -171,9 +169,7 @@ def format_msg(d):
     return (
         f"🚨 تنبيه - {emoji} {d['ticker']} - {d['direction']}\n"
         f"━━━━━━━━━━━━━━\n"
-        f"الشركة: {d['ticker']}\n"
-        f"السترايك: {d['strike']} (ATM)\n"
-        f"المدة: {d['dur']}\n"
+        f"الشركة: {d['ticker']} | السترايك: {d['strike']} | المدة: {d['dur']}\n"
         f"━━━━━━━━━━━━━━\n"
         f"اختراق {d['level']}: {d['breakout']}$\n"
         f"سعر السهم: {d['price']}$\n"
@@ -191,10 +187,8 @@ async def send_all(app, text):
         except: pass
 
 async def check_active(app):
-    # متابعة الفرص النشطة - هل وصلت هدف او وقف
     for t, d in list(ACTIVE.items()):
         if d["status"] != "نشطة": continue
-        # انتهت المدة 60 د
         if (datetime.now(SA) - d["sent_at"]).total_seconds() > 3600:
             d["status"] = "انتهت"; d["result"] = "انتهت المدة"
             del ACTIVE[t]
@@ -208,7 +202,6 @@ async def check_active(app):
         elif cur >= d["tp1"]:
             d["result"] = "✅ هدف اول +30%"
             await send_all(app, f"✅ {t} {d['direction']} وصل الهدف الاول +30% | دخول {d['entry']}$ -> {cur}$")
-            # نخليه يكمل للهدف الثاني
         elif cur <= d["sl"]:
             d["status"] = "انتهت"; d["result"] = "❌ وقف -35%"; del ACTIVE[t]
             await send_all(app, f"❌ {t} {d['direction']} ضرب الوقف -35% | دخول {d['entry']}$ -> {cur}$")
@@ -250,7 +243,7 @@ async def scanner(app):
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
-    await update.message.reply_text("✅ بوت نظيف شغال\nتداول يومي 4 عصراً - 12 صباحاً بتوقيت السعودية\n10 فرص في اليوم | عقود ATM | سبريد ضيق\n/s - فحص شركة\n/status - حالة اليوم")
+    await update.message.reply_text("✅ بوت شغال على شروطك الـ 11\n4 عصراً - 12 صباحاً | 10 فرص | ATM | سبريد ضيق\n/s - فحص شركة\n/status - حالة اليوم")
 
 async def s_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
