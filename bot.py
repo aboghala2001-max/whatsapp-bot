@@ -30,12 +30,6 @@ TODAY = ""
 CHAT_IDS = set()
 LAST_DEBUG = {}
 
-try:
-    from curl_cffi import requests as cffi_requests
-    CFFI = cffi_requests.Session(impersonate="chrome")
-except:
-    CFFI = None
-
 def today_sa():
     return datetime.now(SA).strftime("%Y-%m-%d")
 
@@ -66,36 +60,32 @@ def get_candles(ticker, interval):
         return None
 
 def get_option_atm(ticker, price, is_call):
+    # يدور عقد ATM وبس - ما له دخل التاريخ
     opt_sym = INDX_MAP.get(ticker, {}).get("option", ticker)
     strike = float(round(price))
-    if CFFI is not None:
-        try:
-            url0 = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={opt_sym}"
-            r0 = CFFI.get(url0, timeout=15).json()
-            res0 = r0.get("optionChain", {}).get("result", [])
-            if res0 and res0[0].get("expirationDates"):
-                exp_ts = res0[0]["expirationDates"][0]
-                url = f"https://query2.finance.yahoo.com/v7/finance/options?symbols={opt_sym}&date={exp_ts}"
-                data = CFFI.get(url, timeout=15).json()
-                res = data.get("optionChain", {}).get("result", [])
-                if res:
-                    opts = res[0].get("options", [])
-                    if opts:
-                        lst = opts[0].get("calls" if is_call else "puts", [])
-                        if lst:
-                            best = min(lst, key=lambda x: abs(float(x.get("strike",0))-strike))
-                            bid = float(best.get("bid",0) or 0); ask = float(best.get("ask",0) or 0)
-                            last = float(best.get("lastPrice",0) or 0)
-                            mid = (bid+ask)/2 if bid>0 and ask>0 else last
-                            if mid <= 0: return None
-                            spread = ask - bid if bid>0 and ask>0 else 0
-                            return {"entry": round(mid,2), "bid": round(bid,2), "ask": round(ask,2),
-                                    "strike": float(best["strike"]),
-                                    "expiry": datetime.fromtimestamp(exp_ts, tz=NY).strftime("%Y-%m-%d"),
-                                    "spread": round(spread,2)}
-        except Exception as e:
-            print("opt err", ticker, e)
-    return None
+    try:
+        tk = yf.Ticker(opt_sym)
+        exps = tk.options
+        if not exps: return None
+        exp = exps[0]  # أقرب عقد متوفر، بدون فلترة تاريخ
+        chain = tk.option_chain(exp)
+        df_opt = chain.calls if is_call else chain.puts
+        if df_opt.empty: return None
+        df_opt = df_opt.copy()
+        df_opt["diff"] = abs(df_opt["strike"] - strike)
+        best = df_opt.sort_values("diff").iloc[0]
+        bid = float(best.get("bid", 0) or 0)
+        ask = float(best.get("ask", 0) or 0)
+        last = float(best.get("lastPrice", 0) or 0)
+        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+        if mid <= 0: return None
+        spread = ask - bid if bid > 0 and ask > 0 else 0
+        return {"entry": round(mid,2), "bid": round(bid,2), "ask": round(ask,2),
+                "strike": float(best["strike"]), "expiry": exp,
+                "spread": round(spread,2)}
+    except Exception as e:
+        print("opt err", ticker, e)
+        return None
 
 def analyze(ticker):
     reset_daily()
@@ -113,7 +103,7 @@ def analyze(ticker):
     h15_prev = float(df15["High"].iloc[-2])
     l15_prev = float(df15["Low"].iloc[-2])
 
-    # الشرط الجديد: 5د أو 15د يكفي
+    # الشرط: 5د أو 15د يكفي
     is_call = c5 > h5_prev or c15 > h15_prev
     is_put = c5 < l5_prev or c15 < l15_prev
 
