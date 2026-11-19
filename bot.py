@@ -24,9 +24,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 TZ = ZoneInfo("America/New_York")
 
+# قائمة 30 سهمًا
 TICKERS = [
-    "SPY", "QQQ", "IWM", "NVDA", "TSLA",
-    "META", "AAPL", "AMD", "AMZN", "MU"
+    "SPY", "QQQ", "IWM", "DIA",
+    "NVDA", "TSLA", "META", "AAPL", "AMD",
+    "MSFT", "GOOGL", "AMZN", "MU", "AVGO",
+    "ORCL", "PLTR", "ARM", "CRM",
+    "COIN", "NFLX", "HOOD", "SOFI",
+    "UBER", "SMCI",
+    "JPM", "XOM", "BA", "DIS", "GLD", "TLT"
 ]
 
 MAX_PER_DAY = 10
@@ -76,11 +82,13 @@ def now_ny():
 
 
 def reset_daily_data_if_needed():
+
     global current_day, daily_count, sent_today
 
     today = now_ny().date()
 
     if current_day != today:
+
         current_day = today
         daily_count = 0
         sent_today = set()
@@ -89,6 +97,7 @@ def reset_daily_data_if_needed():
 
 
 def market_is_open_for_scanning():
+
     now = now_ny()
 
     if now.weekday() >= 5:
@@ -98,6 +107,7 @@ def market_is_open_for_scanning():
 
 
 def market_is_open():
+
     now = now_ny()
 
     if now.weekday() >= 5:
@@ -150,6 +160,7 @@ def prepare_candles(ticker, interval):
     )
 
     if df is None or df.empty:
+
         raise ValueError(
             "لم تصل بيانات الشموع من Yahoo Finance"
         )
@@ -175,6 +186,7 @@ def prepare_candles(ticker, interval):
     ]
 
     if df.empty:
+
         raise ValueError("لا توجد شموع مكتملة")
 
     # المتوسط المتحرك
@@ -184,14 +196,18 @@ def prepare_candles(ticker, interval):
     ).mean()
 
     # RSI
-    df["RSI"] = calculate_rsi(df["Close"], 14)
+    df["RSI"] = calculate_rsi(
+        df["Close"],
+        14
+    )
 
     # متوسط حجم التداول
     df["Volume_Avg"] = df["Volume"].rolling(20).mean()
 
+    # إصلاح معالجة القيم الصفرية
     df["Volume_Ratio"] = (
         df["Volume"] /
-        df["Volume_Avg"].replace(0, pd.NA)
+        df["Volume_Avg"].replace(0, float("nan"))
     )
 
     # بيانات اليوم الحالي لحساب VWAP
@@ -202,6 +218,7 @@ def prepare_candles(ticker, interval):
     ].copy()
 
     if today_df.empty:
+
         raise ValueError(
             "لا توجد شموع لليوم الحالي"
         )
@@ -215,6 +232,7 @@ def prepare_candles(ticker, interval):
     volume_sum = today_df["Volume"].sum()
 
     if volume_sum <= 0:
+
         raise ValueError(
             "حجم التداول غير متوفر لحساب VWAP"
         )
@@ -357,6 +375,7 @@ def analyze_ticker(ticker):
             if not failed:
 
                 result["signal"] = signal
+
                 result["reason"] = (
                     f"اكتملت شروط {signal}"
                 )
@@ -853,13 +872,6 @@ async def run_scan(application, manual=False):
 
             last_scan_errors = [message]
 
-            if manual:
-
-                await send_to_subscribers(
-                    application,
-                    message
-                )
-
             return message
 
         if daily_count >= MAX_PER_DAY:
@@ -968,12 +980,8 @@ async def run_scan(application, manual=False):
 
         logger.info(report)
 
-        if manual:
-
-            await send_to_subscribers(
-                application,
-                "🔎 نتيجة الفحص اليدوي\n\n" + report
-            )
+        # لا نرسل التقرير هنا؛ أمر /scan سيرسله
+        # إلى الشخص الذي طلب الفحص مرة واحدة فقط.
 
         return report
 
@@ -1069,6 +1077,7 @@ async def scan_command(
         manual=True
     )
 
+    # إرسال النتيجة مرة واحدة لمستخدم الأمر
     await update.message.reply_text(result)
 
 
@@ -1108,6 +1117,8 @@ async def status_command(
         f"{len(active_trades)}\n"
 
         f"المشتركون: {len(subscribers)}\n"
+
+        f"عدد الأسهم: {len(TICKERS)}\n"
 
         f"السوق ضمن وقت البحث: "
         f"{'نعم' if market_is_open_for_scanning() else 'لا'}"
