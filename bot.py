@@ -330,10 +330,7 @@ def analyze_ticker(ticker):
 
         result["details"] = details
 
-        # -------------------------------------------------
         # شروط الاتجاه الأساسية
-        # -------------------------------------------------
-
         call_core = (
             close5 > vwap
             and close5 > ema5
@@ -348,48 +345,33 @@ def analyze_ticker(ticker):
             and volume_ratio >= 1.2
         )
 
-        # -------------------------------------------------
         # شروط CALL الأصلية
-        # -------------------------------------------------
-
         call_original = (
             call_core
             and 52 <= rsi5 <= 72
         )
 
-        # -------------------------------------------------
         # CALL استمرار الصعود
-        # -------------------------------------------------
-
         call_continuation = (
             call_core
             and rsi5 > 72
             and close5 > previous_close5
         )
 
-        # -------------------------------------------------
         # شروط PUT الأصلية
-        # -------------------------------------------------
-
         put_original = (
             put_core
             and 28 <= rsi5 <= 48
         )
 
-        # -------------------------------------------------
         # PUT استمرار الهبوط
-        # -------------------------------------------------
-
         put_continuation = (
             put_core
             and rsi5 < 28
             and close5 < previous_close5
         )
 
-        # =================================================
         # تصنيف الفرص القوية
-        # =================================================
-
         if call_original:
 
             result["signal"] = "CALL"
@@ -436,10 +418,7 @@ def analyze_ticker(ticker):
 
             return result
 
-        # =================================================
         # تصنيف الفرص المتوسطة
-        # =================================================
-
         if call_core:
 
             result["grade"] = "متوسط"
@@ -464,10 +443,7 @@ def analyze_ticker(ticker):
 
             return result
 
-        # =================================================
         # لا دخول
-        # =================================================
-
         result["grade"] = "لا دخول"
 
         failed_call = []
@@ -519,18 +495,14 @@ def analyze_ticker(ticker):
 
 
 # =====================================================
-# 6. البحث عن عقود 0DTE
+# 6. البحث عن أقرب تاريخ انتهاء متاح للعقود
 # =====================================================
 
 def get_0dte_contract(ticker, signal):
 
-    today_string = now_ny().date().isoformat()
+    today = now_ny().date()
 
-    # -------------------------------------------------
     # قراءة تواريخ الانتهاء مع إعادة المحاولة
-    # حتى عند رجوع قائمة فارغة
-    # -------------------------------------------------
-
     expirations = None
     expiry_errors = []
     stock = None
@@ -592,45 +564,61 @@ def get_0dte_contract(ticker, signal):
         diagnostic = " | ".join(expiry_errors)
 
         raise ValueError(
-            "Yahoo Finance لم يُرجع تواريخ انتهاء "
-            "بعد 3 محاولات. هذا لا يثبت عدم وجود عقود 0DTE. "
+            "Yahoo Finance لم يُرجع أي تواريخ انتهاء "
+            "بعد 3 محاولات. "
             f"تفاصيل المحاولات: {diagnostic}"
         )
 
-    # -------------------------------------------------
     # توحيد صيغة التواريخ
-    # -------------------------------------------------
+    valid_expirations = []
 
-    expirations = [
-        str(expiration)[:10]
-        for expiration in expirations
-    ]
+    for expiration in expirations:
 
-    available_expirations = ", ".join(
-        expirations[:12]
-    )
+        try:
 
-    if today_string not in expirations:
+            expiry_date = datetime.strptime(
+                str(expiration)[:10],
+                "%Y-%m-%d"
+            ).date()
+
+            # تجاهل التواريخ الماضية
+            if expiry_date >= today:
+
+                valid_expirations.append(
+                    expiry_date
+                )
+
+        except Exception:
+
+            continue
+
+    if not valid_expirations:
 
         raise ValueError(
-            f"لم يُرجع Yahoo تاريخ انتهاء اليوم "
-            f"({today_string}). "
-            f"التواريخ التي أعادها Yahoo: "
-            f"{available_expirations}"
+            "Yahoo أعاد تواريخ انتهاء، "
+            "لكن لا يوجد تاريخ اليوم أو تاريخ قادم."
         )
 
-    # -------------------------------------------------
-    # جلب سلسلة عقود اليوم فقط
-    # -------------------------------------------------
+    # اختيار أقرب تاريخ متاح من اليوم فصاعدًا
+    selected_expiry = min(valid_expirations)
 
+    expiry_string = selected_expiry.isoformat()
+
+    logger.info(
+        "%s: أقرب تاريخ انتهاء متاح هو %s",
+        ticker,
+        expiry_string
+    )
+
+    # جلب سلسلة العقود للتاريخ المختار
     try:
 
-        chain = stock.option_chain(today_string)
+        chain = stock.option_chain(expiry_string)
 
     except Exception as e:
 
         raise ValueError(
-            f"تم العثور على تاريخ اليوم {today_string} "
+            f"تم العثور على تاريخ الانتهاء {expiry_string} "
             f"لكن فشل جلب سلسلة العقود: {str(e)[:180]}"
         )
 
@@ -643,13 +631,11 @@ def get_0dte_contract(ticker, signal):
     if options is None or options.empty:
 
         raise ValueError(
-            f"سلسلة عقود {signal} فارغة لتاريخ {today_string}"
+            f"سلسلة عقود {signal} فارغة "
+            f"لتاريخ {expiry_string}"
         )
 
-    # -------------------------------------------------
     # سعر السهم الأساسي
-    # -------------------------------------------------
-
     hist = stock.history(
         period="1d",
         interval="5m"
@@ -694,10 +680,7 @@ def get_0dte_contract(ticker, signal):
 
     total_contracts = len(options)
 
-    # -------------------------------------------------
     # إزالة البيانات الناقصة
-    # -------------------------------------------------
-
     options = options.dropna(
         subset=required_columns
     ).copy()
@@ -711,10 +694,7 @@ def get_0dte_contract(ticker, signal):
             "لكن جميع العقود تحتوي على بيانات ناقصة"
         )
 
-    # -------------------------------------------------
     # شروط السيولة والسعر الأصلية دون تغيير
-    # -------------------------------------------------
-
     options = options[
         (options["bid"] > 0)
         & (options["ask"] > 0)
@@ -736,10 +716,7 @@ def get_0dte_contract(ticker, signal):
             f"Volume >= {MIN_OPTION_VOLUME}"
         )
 
-    # -------------------------------------------------
     # حساب السبريد
-    # -------------------------------------------------
-
     midpoint = (
         options["ask"] + options["bid"]
     ) / 2
@@ -763,10 +740,7 @@ def get_0dte_contract(ticker, signal):
             f"({MAX_SPREAD_PERCENT}%)."
         )
 
-    # -------------------------------------------------
     # اختيار أقرب Strike للسعر الحالي
-    # -------------------------------------------------
-
     options["distance"] = (
         options["strike"] - underlying_price
     ).abs()
@@ -779,11 +753,13 @@ def get_0dte_contract(ticker, signal):
     contract = options.iloc[0]
 
     logger.info(
-        "%s %s: تم العثور على عقد 0DTE مناسب. "
-        "العقود الأصلية=%s، البيانات المكتملة=%s، "
-        "بعد السيولة=%s، بعد السبريد=%s",
+        "%s %s: تم العثور على عقد مناسب. "
+        "تاريخ الانتهاء=%s، العقود الأصلية=%s، "
+        "البيانات المكتملة=%s، بعد السيولة=%s، "
+        "بعد السبريد=%s",
         ticker,
         signal,
+        expiry_string,
         total_contracts,
         valid_data_count,
         liquidity_count,
@@ -804,7 +780,7 @@ def get_0dte_contract(ticker, signal):
             contract["strike"]
         ),
 
-        "expiration": today_string,
+        "expiration": expiry_string,
 
         "bid": float(
             contract["bid"]
@@ -890,7 +866,7 @@ def trade_message(trade):
 
         f"Strike: {trade['strike']:.2f}\n"
 
-        f"الانتهاء: {trade['expiration']} (0DTE)\n\n"
+        f"تاريخ الانتهاء: {trade['expiration']}\n\n"
 
         f"سعر الدخول التقريبي: ${trade['entry']:.2f}\n"
 
@@ -1179,10 +1155,7 @@ async def run_scan(application, manual=False):
                 ticker
             )
 
-            # -------------------------------------------------
             # الفرص المتوسطة أو التي لا تحقق شروط الدخول
-            # -------------------------------------------------
-
             if not analysis["signal"]:
 
                 summary[ticker] = (
@@ -1192,10 +1165,7 @@ async def run_scan(application, manual=False):
 
                 continue
 
-            # -------------------------------------------------
             # لا نرسل إلا الفرص القوية
-            # -------------------------------------------------
-
             if analysis["grade"] != "قوي":
 
                 summary[ticker] = (
@@ -1205,10 +1175,7 @@ async def run_scan(application, manual=False):
 
                 continue
 
-            # -------------------------------------------------
             # البحث عن العقد
-            # -------------------------------------------------
-
             try:
 
                 contract = await asyncio.to_thread(
@@ -1232,7 +1199,9 @@ async def run_scan(application, manual=False):
 
                         f"🟢 تم إرسال {analysis['signal']} قوي | "
 
-                        f"{analysis['details']}"
+                        f"{analysis['details']} | "
+
+                        f"تاريخ الانتهاء: {contract['expiration']}"
                     )
 
                 else:
@@ -1244,7 +1213,7 @@ async def run_scan(application, manual=False):
             except Exception as e:
 
                 reason = (
-                    f"فشل جلب عقد 0DTE\n"
+                    f"فشل جلب العقد\n"
                     f"الإشارة: {analysis['signal']}\n"
                     f"التصنيف: {analysis['grade']}\n"
                     f"المؤشرات: {analysis['details']}\n"
@@ -1258,7 +1227,7 @@ async def run_scan(application, manual=False):
                 )
 
                 logger.warning(
-                    "%s: فشل عقد 0DTE | الإشارة=%s | "
+                    "%s: فشل جلب العقد | الإشارة=%s | "
                     "التفاصيل=%s | السبب=%s",
                     ticker,
                     analysis["signal"],
@@ -1347,7 +1316,7 @@ async def start_command(
 
         "✅ تم تفعيل اشتراكك في Aboghala Bot.\n\n"
 
-        "البوت يبحث عن عقود 0DTE فقط عند توفرها.\n"
+        "البوت يبحث عن أقرب تاريخ انتهاء متاح للعقود.\n"
 
         "يرسل الفرص القوية فقط.\n"
 
@@ -1462,7 +1431,6 @@ async def report_command(
             f"{ticker}: {result}"
         )
 
-    # عرض أخطاء جلب العقود
     if last_scan_errors:
 
         lines.append("\n⚠️ تفاصيل أخطاء جلب العقود:")
@@ -1506,10 +1474,9 @@ async def debug_command(
             f"\n{ticker}: {reason}"
         )
 
-    # عرض أخطاء جلب العقود
     if last_scan_errors:
 
-        lines.append("\n\n⚠️ أخطاء جلب عقود 0DTE:")
+        lines.append("\n\n⚠️ أخطاء جلب العقود:")
 
         for error in last_scan_errors:
 
@@ -1548,6 +1515,8 @@ async def active_command(
             f"\n{ticker} {trade['type']}\n"
 
             f"العقد: {trade['contract']}\n"
+
+            f"تاريخ الانتهاء: {trade['expiration']}\n"
 
             f"الدخول: ${trade['entry']:.2f}"
         )
@@ -1717,5 +1686,6 @@ def main():
 
 
 if __name__ == "__main__":
+
 
     main()
