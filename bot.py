@@ -524,53 +524,83 @@ def analyze_ticker(ticker):
 
 def get_0dte_contract(ticker, signal):
 
-    stock = yf.Ticker(ticker)
-
     today_string = now_ny().date().isoformat()
 
     # -------------------------------------------------
     # قراءة تواريخ الانتهاء مع إعادة المحاولة
+    # حتى عند رجوع قائمة فارغة
     # -------------------------------------------------
 
     expirations = None
-    expiry_error = None
+    expiry_errors = []
+    stock = None
 
     for attempt in range(3):
 
         try:
 
-            expirations = stock.options
-            expiry_error = None
-            break
+            # إنشاء كائن Ticker جديد في كل محاولة
+            stock = yf.Ticker(ticker)
+
+            current_expirations = stock.options
+
+            if current_expirations:
+
+                expirations = current_expirations
+
+                logger.info(
+                    "%s: تم جلب تواريخ الانتهاء في المحاولة %s/3",
+                    ticker,
+                    attempt + 1
+                )
+
+                break
+
+            else:
+
+                expiry_errors.append(
+                    f"المحاولة {attempt + 1}: "
+                    "Yahoo أعاد قائمة تواريخ فارغة"
+                )
+
+                logger.warning(
+                    "%s: قائمة تواريخ الانتهاء فارغة، "
+                    "المحاولة %s/3",
+                    ticker,
+                    attempt + 1
+                )
 
         except Exception as e:
 
-            expiry_error = str(e)
-
-            logger.warning(
-                "%s: فشل جلب تواريخ الانتهاء، المحاولة %s/3: %s",
-                ticker,
-                attempt + 1,
-                expiry_error
+            expiry_errors.append(
+                f"المحاولة {attempt + 1}: {str(e)[:180]}"
             )
 
-            if attempt < 2:
-                sleep(1)
+            logger.warning(
+                "%s: فشل جلب تواريخ الانتهاء، "
+                "المحاولة %s/3: %s",
+                ticker,
+                attempt + 1,
+                str(e)[:180]
+            )
 
-    if expiry_error is not None:
-
-        raise ValueError(
-            "تعذر جلب تواريخ انتهاء الخيارات من Yahoo Finance "
-            f"بعد 3 محاولات. السبب: {expiry_error[:180]}"
-        )
+        if attempt < 2:
+            sleep(1)
 
     if not expirations:
 
+        diagnostic = " | ".join(expiry_errors)
+
         raise ValueError(
-            "Yahoo Finance لم يُرجع أي تواريخ انتهاء لهذا السهم"
+            "Yahoo Finance لم يُرجع تواريخ انتهاء "
+            "بعد 3 محاولات. هذا لا يثبت عدم وجود عقود 0DTE. "
+            f"تفاصيل المحاولات: {diagnostic}"
         )
 
+    # -------------------------------------------------
     # توحيد صيغة التواريخ
+    # -------------------------------------------------
+
     expirations = [
         str(expiration)[:10]
         for expiration in expirations
@@ -583,8 +613,10 @@ def get_0dte_contract(ticker, signal):
     if today_string not in expirations:
 
         raise ValueError(
-            f"لا يوجد تاريخ انتهاء 0DTE اليوم ({today_string}). "
-            f"التواريخ التي أعادها Yahoo: {available_expirations}"
+            f"لم يُرجع Yahoo تاريخ انتهاء اليوم "
+            f"({today_string}). "
+            f"التواريخ التي أعادها Yahoo: "
+            f"{available_expirations}"
         )
 
     # -------------------------------------------------
