@@ -204,7 +204,7 @@ def prepare_candles(ticker, interval):
     # متوسط حجم التداول
     df["Volume_Avg"] = df["Volume"].rolling(20).mean()
 
-    # إصلاح معالجة القيم الصفرية
+    # معالجة القيم الصفرية
     df["Volume_Ratio"] = (
         df["Volume"] /
         df["Volume_Avg"].replace(0, float("nan"))
@@ -246,7 +246,7 @@ def prepare_candles(ticker, interval):
 
 
 # =====================================================
-# 5. تحليل السهم وتشخيص الشروط
+# 5. تحليل السهم وتصنيف الفرص
 # =====================================================
 
 def analyze_ticker(ticker):
@@ -254,6 +254,7 @@ def analyze_ticker(ticker):
     result = {
         "ticker": ticker,
         "signal": None,
+        "grade": "لا دخول",
         "reason": "",
         "details": ""
     }
@@ -281,11 +282,14 @@ def analyze_ticker(ticker):
             return result
 
         c5 = df5.iloc[-1]
+        previous_c5 = df5.iloc[-2]
         c15 = df15.iloc[-1]
 
         vwap = today5.iloc[-1]["VWAP"]
 
         close5 = float(c5["Close"])
+        previous_close5 = float(previous_c5["Close"])
+
         ema5 = float(c5["EMA20"])
         rsi5 = float(c5["RSI"])
         volume_ratio = float(c5["Volume_Ratio"])
@@ -297,6 +301,7 @@ def analyze_ticker(ticker):
 
         values = [
             close5,
+            previous_close5,
             ema5,
             rsi5,
             volume_ratio,
@@ -313,46 +318,6 @@ def analyze_ticker(ticker):
 
             return result
 
-        # شروط CALL و PUT
-        conditions = {
-
-            "CALL": {
-
-                "السعر فوق VWAP":
-                    close5 > vwap,
-
-                "السعر فوق EMA20":
-                    close5 > ema5,
-
-                "اتجاه 15 دقيقة صاعد":
-                    close15 > ema15,
-
-                "RSI بين 52 و72":
-                    52 <= rsi5 <= 72,
-
-                "حجم التداول 1.2x أو أكثر":
-                    volume_ratio >= 1.2
-            },
-
-            "PUT": {
-
-                "السعر تحت VWAP":
-                    close5 < vwap,
-
-                "السعر تحت EMA20":
-                    close5 < ema5,
-
-                "اتجاه 15 دقيقة هابط":
-                    close15 < ema15,
-
-                "RSI بين 28 و48":
-                    28 <= rsi5 <= 48,
-
-                "حجم التداول 1.2x أو أكثر":
-                    volume_ratio >= 1.2
-            }
-        }
-
         details = (
             f"السعر={close5:.2f} | "
             f"VWAP={vwap:.2f} | "
@@ -364,31 +329,182 @@ def analyze_ticker(ticker):
 
         result["details"] = details
 
-        for signal in ["CALL", "PUT"]:
+        # -------------------------------------------------
+        # شروط الاتجاه الأساسية
+        # -------------------------------------------------
 
-            failed = [
-                name
-                for name, passed in conditions[signal].items()
-                if not passed
-            ]
+        call_core = (
+            close5 > vwap
+            and close5 > ema5
+            and close15 > ema15
+            and volume_ratio >= 1.2
+        )
 
-            if not failed:
+        put_core = (
+            close5 < vwap
+            and close5 < ema5
+            and close15 < ema15
+            and volume_ratio >= 1.2
+        )
 
-                result["signal"] = signal
+        # -------------------------------------------------
+        # شروط CALL الأصلية
+        # -------------------------------------------------
 
-                result["reason"] = (
-                    f"اكتملت شروط {signal}"
-                )
+        call_original = (
+            call_core
+            and 52 <= rsi5 <= 72
+        )
 
-                return result
+        # -------------------------------------------------
+        # CALL استمرار الصعود
+        # RSI أعلى من 72 مع تأكيد شمعة صاعدة
+        # -------------------------------------------------
 
-            result[f"{signal}_failed"] = failed
+        call_continuation = (
+            call_core
+            and rsi5 > 72
+            and close5 > previous_close5
+        )
+
+        # -------------------------------------------------
+        # شروط PUT الأصلية
+        # -------------------------------------------------
+
+        put_original = (
+            put_core
+            and 28 <= rsi5 <= 48
+        )
+
+        # -------------------------------------------------
+        # PUT استمرار الهبوط
+        # RSI أقل من 28 مع تأكيد شمعة هابطة
+        # -------------------------------------------------
+
+        put_continuation = (
+            put_core
+            and rsi5 < 28
+            and close5 < previous_close5
+        )
+
+        # =================================================
+        # تصنيف الفرص القوية
+        # =================================================
+
+        if call_original:
+
+            result["signal"] = "CALL"
+            result["grade"] = "قوي"
+
+            result["reason"] = (
+                "🟢 CALL قوي: اكتملت الشروط الأصلية"
+            )
+
+            return result
+
+        if call_continuation:
+
+            result["signal"] = "CALL"
+            result["grade"] = "قوي"
+
+            result["reason"] = (
+                "🟢 CALL قوي: استمرار الصعود "
+                "مع تأكيد إغلاق الشمعة"
+            )
+
+            return result
+
+        if put_original:
+
+            result["signal"] = "PUT"
+            result["grade"] = "قوي"
+
+            result["reason"] = (
+                "🟢 PUT قوي: اكتملت الشروط الأصلية"
+            )
+
+            return result
+
+        if put_continuation:
+
+            result["signal"] = "PUT"
+            result["grade"] = "قوي"
+
+            result["reason"] = (
+                "🟢 PUT قوي: استمرار الهبوط "
+                "مع تأكيد إغلاق الشمعة"
+            )
+
+            return result
+
+        # =================================================
+        # تصنيف الفرص المتوسطة
+        # توافق الاتجاه والحجم دون اكتمال RSI
+        # =================================================
+
+        if call_core:
+
+            result["grade"] = "متوسط"
+
+            result["reason"] = (
+                "🟡 CALL متوسط: الاتجاه والحجم متوافقان "
+                "لكن شرط RSI أو تأكيد الاستمرار غير مكتمل.\n"
+                + details
+            )
+
+            return result
+
+        if put_core:
+
+            result["grade"] = "متوسط"
+
+            result["reason"] = (
+                "🟡 PUT متوسط: الاتجاه والحجم متوافقان "
+                "لكن شرط RSI أو تأكيد الاستمرار غير مكتمل.\n"
+                + details
+            )
+
+            return result
+
+        # =================================================
+        # لا دخول
+        # =================================================
+
+        result["grade"] = "لا دخول"
+
+        failed_call = []
+        failed_put = []
+
+        if not close5 > vwap:
+            failed_call.append("السعر ليس فوق VWAP")
+
+        if not close5 > ema5:
+            failed_call.append("السعر ليس فوق EMA20")
+
+        if not close15 > ema15:
+            failed_call.append("اتجاه 15 دقيقة ليس صاعدًا")
+
+        if not volume_ratio >= 1.2:
+            failed_call.append("حجم التداول أقل من 1.2x")
+
+        if not close5 < vwap:
+            failed_put.append("السعر ليس تحت VWAP")
+
+        if not close5 < ema5:
+            failed_put.append("السعر ليس تحت EMA20")
+
+        if not close15 < ema15:
+            failed_put.append("اتجاه 15 دقيقة ليس هابطًا")
+
+        if not volume_ratio >= 1.2:
+            failed_put.append("حجم التداول أقل من 1.2x")
 
         result["reason"] = (
-            "CALL ناقص: "
-            + ", ".join(result["CALL_failed"])
-            + "\nPUT ناقص: "
-            + ", ".join(result["PUT_failed"])
+            "🔴 لا دخول\n"
+            "CALL: "
+            + ", ".join(failed_call)
+            + "\nPUT: "
+            + ", ".join(failed_put)
             + "\n"
             + details
         )
@@ -616,6 +732,8 @@ def trade_message(trade):
         f"السهم: {trade['symbol']}\n"
 
         f"النوع: {trade['type']}\n"
+
+        f"قوة الفرصة: {trade.get('grade', 'قوي')} 🟢\n"
 
         f"العقد: {trade['contract']}\n"
 
@@ -910,9 +1028,30 @@ async def run_scan(application, manual=False):
                 ticker
             )
 
+            # -------------------------------------------------
+            # الفرص المتوسطة أو التي لا تحقق شروط الدخول
+            # لا يتم إرسال تنبيه لها
+            # -------------------------------------------------
+
             if not analysis["signal"]:
 
-                summary[ticker] = analysis["reason"]
+                summary[ticker] = (
+                    f"{analysis['grade']} | "
+                    f"{analysis['reason']}"
+                )
+
+                continue
+
+            # -------------------------------------------------
+            # لا نرسل إلا الفرص القوية
+            # -------------------------------------------------
+
+            if analysis["grade"] != "قوي":
+
+                summary[ticker] = (
+                    f"لم يتم الإرسال: {analysis['grade']} | "
+                    f"{analysis['reason']}"
+                )
 
                 continue
 
@@ -925,6 +1064,8 @@ async def run_scan(application, manual=False):
                     analysis["signal"]
                 )
 
+                contract["grade"] = analysis["grade"]
+
                 sent = await open_trade(
                     application,
                     ticker,
@@ -936,7 +1077,7 @@ async def run_scan(application, manual=False):
 
                     summary[ticker] = (
 
-                        f"تم إرسال {analysis['signal']} | "
+                        f"🟢 تم إرسال {analysis['signal']} قوي | "
 
                         f"{analysis['details']}"
                     )
@@ -979,9 +1120,6 @@ async def run_scan(application, manual=False):
         )
 
         logger.info(report)
-
-        # لا نرسل التقرير هنا؛ أمر /scan سيرسله
-        # إلى الشخص الذي طلب الفحص مرة واحدة فقط.
 
         return report
 
@@ -1045,6 +1183,10 @@ async def start_command(
 
         "البوت يبحث عن عقود 0DTE فقط عند توفرها.\n"
 
+        "يرسل الفرص القوية فقط.\n"
+
+        "الفرص المتوسطة تظهر في التشخيص فقط.\n\n"
+
         "التنبيهات فرص تحليلية وليست أوامر تداول.\n\n"
 
         "الأوامر:\n"
@@ -1077,7 +1219,6 @@ async def scan_command(
         manual=True
     )
 
-    # إرسال النتيجة مرة واحدة لمستخدم الأمر
     await update.message.reply_text(result)
 
 
@@ -1178,7 +1319,10 @@ async def debug_command(
         return
 
     lines = [
-        "🔬 تشخيص الأسهم"
+        "🔬 تشخيص الأسهم\n",
+        "🟢 قوي: يرسل تنبيهًا عند توفر عقد مناسب.",
+        "🟡 متوسط: يظهر هنا فقط ولا يرسل تنبيهًا.",
+        "🔴 لا دخول: الشروط الأساسية غير مكتملة."
     ]
 
     for ticker, reason in last_scan_summary.items():
@@ -1244,7 +1388,7 @@ async def help_command(
 
         "/report - تقرير الفحص\n"
 
-        "/debug - تشخيص أسباب رفض الأسهم\n"
+        "/debug - تشخيص أسباب رفض الأسهم وتصنيفها\n"
 
         "/active - الصفقات النشطة\n"
 
