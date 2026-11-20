@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pandas as pd
 import yfinance as yf
+import requests
 
 from telegram import Update
 from telegram.ext import (
@@ -16,6 +17,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+
 
 # =====================================================
 # 1. الإعدادات
@@ -64,21 +66,203 @@ logging.basicConfig(
 
 logger = logging.getLogger("AboghalaBot")
 
+
+# =====================================================
+# 3. اختبار اتصال Yahoo Finance لجميع الأسهم
+# =====================================================
+
+def test_yahoo_options():
+
+    logger.info(
+        "========== بدء اختبار Yahoo Options لجميع الأسهم =========="
+    )
+
+    total = len(TICKERS)
+
+    successful_endpoints = 0
+    failed_endpoints = 0
+
+    endpoints_with_dates = []
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/json"
+    }
+
+    for index, ticker in enumerate(TICKERS, start=1):
+
+        logger.info(
+            "YAHOO TEST | بدء فحص السهم %s من %s | %s",
+            index,
+            total,
+            ticker
+        )
+
+        for host in ("query1", "query2"):
+
+            url = (
+                f"https://{host}.finance.yahoo.com"
+                f"/v7/finance/options/{ticker}"
+            )
+
+            try:
+
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=15
+                )
+
+                status = response.status_code
+
+                content_type = response.headers.get(
+                    "Content-Type",
+                    "غير معروف"
+                )
+
+                logger.warning(
+                    "YAHOO TEST | %s | %s | HTTP=%s | Content-Type=%s",
+                    ticker,
+                    host,
+                    status,
+                    content_type
+                )
+
+                try:
+
+                    data = response.json()
+
+                except Exception:
+
+                    failed_endpoints += 1
+
+                    logger.warning(
+                        "YAHOO TEST | %s | %s | "
+                        "الاستجابة ليست JSON | بداية المحتوى: %s",
+                        ticker,
+                        host,
+                        response.text[:200]
+                    )
+
+                    continue
+
+                chain = data.get("optionChain") or {}
+
+                results = chain.get("result") or []
+
+                if results:
+
+                    dates = results[0].get(
+                        "expirationDates"
+                    ) or []
+
+                    if dates:
+
+                        successful_endpoints += 1
+
+                        endpoints_with_dates.append(
+                            (ticker, host, len(dates))
+                        )
+
+                    else:
+
+                        failed_endpoints += 1
+
+                    logger.warning(
+                        "YAHOO TEST | %s | %s | "
+                        "عدد تواريخ الانتهاء=%s | أول التواريخ=%s",
+                        ticker,
+                        host,
+                        len(dates),
+                        dates[:5]
+                    )
+
+                else:
+
+                    failed_endpoints += 1
+
+                    logger.warning(
+                        "YAHOO TEST | %s | %s | "
+                        "EMPTY RESULT | error=%s",
+                        ticker,
+                        host,
+                        chain.get("error")
+                    )
+
+            except requests.RequestException as e:
+
+                failed_endpoints += 1
+
+                logger.warning(
+                    "YAHOO TEST | %s | %s | REQUEST ERROR=%s",
+                    ticker,
+                    host,
+                    str(e)[:200]
+                )
+
+            except Exception as e:
+
+                failed_endpoints += 1
+
+                logger.warning(
+                    "YAHOO TEST | %s | %s | ERROR=%s",
+                    ticker,
+                    host,
+                    str(e)[:200]
+                )
+
+    logger.info(
+        "========== انتهى اختبار Yahoo Options =========="
+    )
+
+    logger.info(
+        "YAHOO TEST SUMMARY | "
+        "الأسهم المفحوصة=%s | "
+        "إجمالي نقاط الاتصال=%s | "
+        "نقاط الاتصال التي أعادت تواريخ=%s | "
+        "نقاط الاتصال الفاشلة أو الفارغة=%s",
+        total,
+        total * 2,
+        successful_endpoints,
+        failed_endpoints
+    )
+
+    if endpoints_with_dates:
+
+        logger.info(
+            "YAHOO TEST SUMMARY | نتائج بها تواريخ: %s",
+            endpoints_with_dates
+        )
+
+
+# =====================================================
+# 4. حالة البوت
+# =====================================================
+
 subscribers = set()
+
 active_trades = {}
 
 sent_today = set()
+
 daily_count = 0
+
 current_day = None
 
 last_scan_time = None
+
 last_scan_summary = {}
+
 last_scan_errors = []
 
 scan_lock = asyncio.Lock()
 
 
 def now_ny():
+
     return datetime.now(TZ)
 
 
@@ -91,10 +275,14 @@ def reset_daily_data_if_needed():
     if current_day != today:
 
         current_day = today
+
         daily_count = 0
+
         sent_today = set()
 
-        logger.info("تم تصفير عداد الفرص لليوم الجديد")
+        logger.info(
+            "تم تصفير عداد الفرص لليوم الجديد"
+        )
 
 
 def market_is_open_for_scanning():
@@ -118,7 +306,7 @@ def market_is_open():
 
 
 # =====================================================
-# 3. حساب المؤشرات الفنية
+# 5. حساب المؤشرات الفنية
 # =====================================================
 
 def calculate_rsi(series, period=14):
@@ -126,6 +314,7 @@ def calculate_rsi(series, period=14):
     delta = series.diff()
 
     gain = delta.clip(lower=0)
+
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
@@ -146,7 +335,7 @@ def calculate_rsi(series, period=14):
 
 
 # =====================================================
-# 4. جلب الشموع وتجهيز المؤشرات
+# 6. جلب الشموع وتجهيز المؤشرات
 # =====================================================
 
 def prepare_candles(ticker, interval):
@@ -169,8 +358,11 @@ def prepare_candles(ticker, interval):
     df = df.copy()
 
     if df.index.tz is None:
+
         df.index = df.index.tz_localize(TZ)
+
     else:
+
         df.index = df.index.tz_convert(TZ)
 
     now = now_ny()
@@ -188,7 +380,9 @@ def prepare_candles(ticker, interval):
 
     if df.empty:
 
-        raise ValueError("لا توجد شموع مكتملة")
+        raise ValueError(
+            "لا توجد شموع مكتملة"
+        )
 
     # المتوسط المتحرك
     df["EMA20"] = df["Close"].ewm(
@@ -247,7 +441,7 @@ def prepare_candles(ticker, interval):
 
 
 # =====================================================
-# 5. تحليل السهم وتصنيف الفرص
+# 7. تحليل السهم وتصنيف الفرص
 # =====================================================
 
 def analyze_ticker(ticker):
@@ -283,19 +477,25 @@ def analyze_ticker(ticker):
             return result
 
         c5 = df5.iloc[-1]
+
         previous_c5 = df5.iloc[-2]
+
         c15 = df15.iloc[-1]
 
         vwap = today5.iloc[-1]["VWAP"]
 
         close5 = float(c5["Close"])
+
         previous_close5 = float(previous_c5["Close"])
 
         ema5 = float(c5["EMA20"])
+
         rsi5 = float(c5["RSI"])
+
         volume_ratio = float(c5["Volume_Ratio"])
 
         close15 = float(c15["Close"])
+
         ema15 = float(c15["EMA20"])
 
         vwap = float(vwap)
@@ -375,6 +575,7 @@ def analyze_ticker(ticker):
         if call_original:
 
             result["signal"] = "CALL"
+
             result["grade"] = "قوي"
 
             result["reason"] = (
@@ -386,6 +587,7 @@ def analyze_ticker(ticker):
         if call_continuation:
 
             result["signal"] = "CALL"
+
             result["grade"] = "قوي"
 
             result["reason"] = (
@@ -398,6 +600,7 @@ def analyze_ticker(ticker):
         if put_original:
 
             result["signal"] = "PUT"
+
             result["grade"] = "قوي"
 
             result["reason"] = (
@@ -409,6 +612,7 @@ def analyze_ticker(ticker):
         if put_continuation:
 
             result["signal"] = "PUT"
+
             result["grade"] = "قوي"
 
             result["reason"] = (
@@ -447,6 +651,7 @@ def analyze_ticker(ticker):
         result["grade"] = "لا دخول"
 
         failed_call = []
+
         failed_put = []
 
         if not close5 > vwap:
@@ -495,7 +700,7 @@ def analyze_ticker(ticker):
 
 
 # =====================================================
-# 6. البحث عن أقرب تاريخ انتهاء متاح للعقود
+# 8. البحث عن أقرب تاريخ انتهاء متاح للعقود
 # =====================================================
 
 def get_0dte_contract(ticker, signal):
@@ -504,7 +709,9 @@ def get_0dte_contract(ticker, signal):
 
     # قراءة تواريخ الانتهاء مع إعادة المحاولة
     expirations = None
+
     expiry_errors = []
+
     stock = None
 
     for attempt in range(3):
@@ -811,7 +1018,7 @@ def get_0dte_contract(ticker, signal):
 
 
 # =====================================================
-# 7. متابعة أسعار العقود
+# 9. متابعة أسعار العقود
 # =====================================================
 
 def get_contract_quote(contract_symbol):
@@ -847,7 +1054,7 @@ def get_contract_quote(contract_symbol):
 
 
 # =====================================================
-# 8. إرسال التنبيهات
+# 10. إرسال التنبيهات
 # =====================================================
 
 def trade_message(trade):
@@ -963,7 +1170,7 @@ async def open_trade(
 
 
 # =====================================================
-# 9. مراقبة الأهداف ووقف الخسارة
+# 11. مراقبة الأهداف ووقف الخسارة
 # =====================================================
 
 async def monitor_trades(application):
@@ -1075,7 +1282,7 @@ async def monitor_trades(application):
 
 
 # =====================================================
-# 10. محرك الفحص
+# 12. محرك الفحص
 # =====================================================
 
 async def run_scan(application, manual=False):
@@ -1098,6 +1305,7 @@ async def run_scan(application, manual=False):
         last_scan_time = now_ny()
 
         summary = {}
+
         errors = []
 
         if not market_is_open_for_scanning():
@@ -1260,7 +1468,7 @@ async def run_scan(application, manual=False):
 
 
 # =====================================================
-# 11. الفحص التلقائي
+# 13. الفحص التلقائي
 # =====================================================
 
 async def scanner_loop(application):
@@ -1300,7 +1508,7 @@ async def scanner_loop(application):
 
 
 # =====================================================
-# 12. أوامر تيليجرام
+# 14. أوامر تيليجرام
 # =====================================================
 
 async def start_command(
@@ -1550,7 +1758,7 @@ async def help_command(
 
 
 # =====================================================
-# 13. بدء المهام
+# 15. بدء المهام
 # =====================================================
 
 async def post_init(application):
@@ -1561,7 +1769,7 @@ async def post_init(application):
 
 
 # =====================================================
-# 14. خادم Render
+# 16. خادم Render
 # =====================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -1619,7 +1827,7 @@ def start_health_server():
 
 
 # =====================================================
-# 15. تشغيل البوت
+# 17. تشغيل البوت
 # =====================================================
 
 def main():
@@ -1685,7 +1893,14 @@ def main():
     )
 
 
+# =====================================================
+# 18. نقطة البداية
+# =====================================================
+
 if __name__ == "__main__":
 
+    # اختبار Yahoo لجميع الأسهم قبل بدء البوت
+    test_yahoo_options()
 
+    # تشغيل البوت بعد انتهاء الاختبار
     main()
