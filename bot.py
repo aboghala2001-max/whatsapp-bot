@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import threading
+from time import sleep
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -358,7 +359,6 @@ def analyze_ticker(ticker):
 
         # -------------------------------------------------
         # CALL استمرار الصعود
-        # RSI أعلى من 72 مع تأكيد شمعة صاعدة
         # -------------------------------------------------
 
         call_continuation = (
@@ -378,7 +378,6 @@ def analyze_ticker(ticker):
 
         # -------------------------------------------------
         # PUT استمرار الهبوط
-        # RSI أقل من 28 مع تأكيد شمعة هابطة
         # -------------------------------------------------
 
         put_continuation = (
@@ -439,7 +438,6 @@ def analyze_ticker(ticker):
 
         # =================================================
         # تصنيف الفرص المتوسطة
-        # توافق الاتجاه والحجم دون اكتمال RSI
         # =================================================
 
         if call_core:
@@ -530,18 +528,79 @@ def get_0dte_contract(ticker, signal):
 
     today_string = now_ny().date().isoformat()
 
-    expirations = stock.options
+    # -------------------------------------------------
+    # قراءة تواريخ الانتهاء مع إعادة المحاولة
+    # -------------------------------------------------
 
-    if (
-        not expirations
-        or today_string not in expirations
-    ):
+    expirations = None
+    expiry_error = None
+
+    for attempt in range(3):
+
+        try:
+
+            expirations = stock.options
+            expiry_error = None
+            break
+
+        except Exception as e:
+
+            expiry_error = str(e)
+
+            logger.warning(
+                "%s: فشل جلب تواريخ الانتهاء، المحاولة %s/3: %s",
+                ticker,
+                attempt + 1,
+                expiry_error
+            )
+
+            if attempt < 2:
+                sleep(1)
+
+    if expiry_error is not None:
 
         raise ValueError(
-            "لا يوجد تاريخ انتهاء اليوم لهذا السهم"
+            "تعذر جلب تواريخ انتهاء الخيارات من Yahoo Finance "
+            f"بعد 3 محاولات. السبب: {expiry_error[:180]}"
         )
 
-    chain = stock.option_chain(today_string)
+    if not expirations:
+
+        raise ValueError(
+            "Yahoo Finance لم يُرجع أي تواريخ انتهاء لهذا السهم"
+        )
+
+    # توحيد صيغة التواريخ
+    expirations = [
+        str(expiration)[:10]
+        for expiration in expirations
+    ]
+
+    available_expirations = ", ".join(
+        expirations[:12]
+    )
+
+    if today_string not in expirations:
+
+        raise ValueError(
+            f"لا يوجد تاريخ انتهاء 0DTE اليوم ({today_string}). "
+            f"التواريخ التي أعادها Yahoo: {available_expirations}"
+        )
+
+    # -------------------------------------------------
+    # جلب سلسلة عقود اليوم فقط
+    # -------------------------------------------------
+
+    try:
+
+        chain = stock.option_chain(today_string)
+
+    except Exception as e:
+
+        raise ValueError(
+            f"تم العثور على تاريخ اليوم {today_string} "
+            f"لكن فشل جلب سلسلة العقود: {str(e)[:180]}"
+        )
 
     options = (
         chain.calls
@@ -552,8 +611,12 @@ def get_0dte_contract(ticker, signal):
     if options is None or options.empty:
 
         raise ValueError(
-            "سلسلة العقود فارغة"
+            f"سلسلة عقود {signal} فارغة لتاريخ {today_string}"
         )
+
+    # -------------------------------------------------
+    # سعر السهم الأساسي
+    # -------------------------------------------------
 
     hist = stock.history(
         period="1d",
@@ -563,11 +626,20 @@ def get_0dte_contract(ticker, signal):
     if hist is None or hist.empty:
 
         raise ValueError(
-            "تعذر الحصول على سعر السهم"
+            "تم جلب سلسلة الخيارات لكن تعذر الحصول "
+            "على سعر السهم الأساسي"
+        )
+
+    underlying_prices = hist["Close"].dropna()
+
+    if underlying_prices.empty:
+
+        raise ValueError(
+            "سعر السهم الأساسي غير متوفر"
         )
 
     underlying_price = float(
-        hist["Close"].dropna().iloc[-1]
+        underlying_prices.iloc[-1]
     )
 
     options = options.copy()
@@ -585,14 +657,32 @@ def get_0dte_contract(ticker, signal):
         if col not in options.columns:
 
             raise ValueError(
-                f"بيانات العقد ناقصة: {col}"
+                f"بيانات العقود ناقصة: {col}"
             )
+
+    total_contracts = len(options)
+
+    # -------------------------------------------------
+    # إزالة البيانات الناقصة
+    # -------------------------------------------------
 
     options = options.dropna(
         subset=required_columns
-    )
+    ).copy()
 
-    # شروط السيولة والسعر
+    valid_data_count = len(options)
+
+    if options.empty:
+
+        raise ValueError(
+            f"سلسلة {signal} تحتوي على {total_contracts} عقد، "
+            "لكن جميع العقود تحتوي على بيانات ناقصة"
+        )
+
+    # -------------------------------------------------
+    # شروط السيولة والسعر الأصلية دون تغيير
+    # -------------------------------------------------
+
     options = options[
         (options["bid"] > 0)
         & (options["ask"] > 0)
@@ -601,13 +691,23 @@ def get_0dte_contract(ticker, signal):
         & (options["volume"] >= MIN_OPTION_VOLUME)
     ].copy()
 
+    liquidity_count = len(options)
+
     if options.empty:
 
         raise ValueError(
-            "لا توجد عقود تحقق شروط السيولة والسعر"
+            f"وجد {total_contracts} عقد {signal}، "
+            f"والبيانات المكتملة {valid_data_count}، "
+            "لكن لا يوجد عقد يحقق شروط السعر والسيولة. "
+            f"الشروط: Ask >= {MIN_OPTION_PRICE}، "
+            f"Open Interest >= {MIN_OPEN_INTEREST}، "
+            f"Volume >= {MIN_OPTION_VOLUME}"
         )
 
-    # حساب فرق السعر نسبة إلى منتصف Bid و Ask
+    # -------------------------------------------------
+    # حساب السبريد
+    # -------------------------------------------------
+
     midpoint = (
         options["ask"] + options["bid"]
     ) / 2
@@ -621,13 +721,20 @@ def get_0dte_contract(ticker, signal):
         options["spread_pct"] <= MAX_SPREAD_PERCENT
     ].copy()
 
+    spread_count = len(options)
+
     if options.empty:
 
         raise ValueError(
-            "العقود المتاحة فروق أسعارها مرتفعة"
+            f"وجد {liquidity_count} عقدًا يحقق شروط السعر والسيولة، "
+            f"لكن جميعها تجاوزت الحد الأقصى للسبريد "
+            f"({MAX_SPREAD_PERCENT}%)."
         )
 
+    # -------------------------------------------------
     # اختيار أقرب Strike للسعر الحالي
+    # -------------------------------------------------
+
     options["distance"] = (
         options["strike"] - underlying_price
     ).abs()
@@ -638,6 +745,18 @@ def get_0dte_contract(ticker, signal):
     )
 
     contract = options.iloc[0]
+
+    logger.info(
+        "%s %s: تم العثور على عقد 0DTE مناسب. "
+        "العقود الأصلية=%s، البيانات المكتملة=%s، "
+        "بعد السيولة=%s، بعد السبريد=%s",
+        ticker,
+        signal,
+        total_contracts,
+        valid_data_count,
+        liquidity_count,
+        spread_count
+    )
 
     return {
 
@@ -1030,7 +1149,6 @@ async def run_scan(application, manual=False):
 
             # -------------------------------------------------
             # الفرص المتوسطة أو التي لا تحقق شروط الدخول
-            # لا يتم إرسال تنبيه لها
             # -------------------------------------------------
 
             if not analysis["signal"]:
@@ -1055,7 +1173,10 @@ async def run_scan(application, manual=False):
 
                 continue
 
+            # -------------------------------------------------
             # البحث عن العقد
+            # -------------------------------------------------
+
             try:
 
                 contract = await asyncio.to_thread(
@@ -1091,13 +1212,26 @@ async def run_scan(application, manual=False):
             except Exception as e:
 
                 reason = (
-                    f"فشل عقد 0DTE: {str(e)[:150]}"
+                    f"فشل جلب عقد 0DTE\n"
+                    f"الإشارة: {analysis['signal']}\n"
+                    f"التصنيف: {analysis['grade']}\n"
+                    f"المؤشرات: {analysis['details']}\n"
+                    f"سبب الفشل: {str(e)[:500]}"
                 )
 
                 summary[ticker] = reason
 
                 errors.append(
-                    f"{ticker}: {reason}"
+                    f"{ticker} | {analysis['signal']} | {reason}"
+                )
+
+                logger.warning(
+                    "%s: فشل عقد 0DTE | الإشارة=%s | "
+                    "التفاصيل=%s | السبب=%s",
+                    ticker,
+                    analysis["signal"],
+                    analysis["details"],
+                    str(e)
                 )
 
         last_scan_summary = summary
@@ -1296,6 +1430,15 @@ async def report_command(
             f"{ticker}: {result}"
         )
 
+    # عرض أخطاء جلب العقود
+    if last_scan_errors:
+
+        lines.append("\n⚠️ تفاصيل أخطاء جلب العقود:")
+
+        for error in last_scan_errors:
+
+            lines.append(error)
+
     text = "\n".join(lines)
 
     for i in range(0, len(text), 3500):
@@ -1330,6 +1473,15 @@ async def debug_command(
         lines.append(
             f"\n{ticker}: {reason}"
         )
+
+    # عرض أخطاء جلب العقود
+    if last_scan_errors:
+
+        lines.append("\n\n⚠️ أخطاء جلب عقود 0DTE:")
+
+        for error in last_scan_errors:
+
+            lines.append(f"\n{error}")
 
     text = "\n".join(lines)
 
