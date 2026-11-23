@@ -25,9 +25,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TZ_NY = ZoneInfo("America/New_York")
 TZ_SA = ZoneInfo("Asia/Riyadh")
 
+
 # =====================================================
 # قائمة الأسهم الموسعة
-# أكثر من 200 رمز من قطاعات مختلفة
 # =====================================================
 
 TICKERS = list(dict.fromkeys([
@@ -113,15 +113,15 @@ TICKERS = list(dict.fromkeys([
     "GRAB", "CPNG", "TME", "BILI", "YMM",
     "ZTO", "BEKE", "VIPS", "TAL", "EDU",
 
-    # صناديق ومؤشرات
-    "SPY", "QQQ", "IWM", "DIA", "XLF",
+    # صناديق وقطاعات
+    "QQQ", "IWM", "DIA", "XLF",
     "XLE", "XLK", "SMH", "SOXX", "ARKK",
     "GLD", "SLV", "TLT", "HYG", "XLI",
     "XLY", "XLP", "XLV", "XBI", "KRE"
 
 ]))
 
-# إزالة الرموز التي نعرف أنها لم تعد متداولة
+# إزالة الرموز المستبعدة في قائمتك الأصلية
 REMOVED_TICKERS = {
     "WBD",
     "QRVO"
@@ -132,21 +132,23 @@ TICKERS = [
     if ticker not in REMOVED_TICKERS
 ]
 
+
+# =====================================================
+# إعدادات التداول
+# =====================================================
+
 MIN_STOCK_PRICE = 10.0
 MAX_STOCK_PRICE = 100.0
 
 MAX_PER_DAY = 10
 MAX_ACTIVE_TRADES = 15
 
-# الفحص على دفعات
 SCAN_BATCH_SIZE = 12
-
-# كل 3 دقائق تقريبًا
 SCAN_INTERVAL = 180
+MONITOR_INTERVAL = 60
 
 # توقيت السعودية
 SAUDI_SCAN_START = time(17, 0)
-SAUDI_SCAN_END = time(0, 0)
 
 # توقيت نيويورك
 START_SCAN_NY = time(9, 40)
@@ -160,7 +162,13 @@ ATR_STOP_MULTIPLIER = 1.2
 MAX_STOP_PERCENT = 4.0
 MAX_ENTRY_DEVIATION = 0.003
 
-MONITOR_INTERVAL = 60
+# الأهداف بالدولار
+TARGET1_MIN_DOLLARS = 1.00
+TARGET2_MIN_DOLLARS = 2.00
+
+# مضاعفات المخاطرة
+TARGET1_R_MULTIPLE = 2.0
+TARGET2_R_MULTIPLE = 3.0
 
 YAHOO_RETRIES = 2
 YAHOO_RETRY_DELAY = 2
@@ -170,16 +178,10 @@ YAHOO_LOCK = threading.RLock()
 PRICE_CACHE = {}
 PRICE_CACHE_TTL = 30
 
-# تخزين مؤقت للأسهم التي لا تتوفر بياناتها
 NO_DATA_CACHE = {}
-NO_DATA_CACHE_TTL = 60 * 60
+NO_DATA_CACHE_TTL = 20 * 60
 
-# تدوير قائمة الأسهم
 scan_cursor = 0
-
-# تخزين حالة السوق مؤقتًا
-last_regime_check = 0
-REGIME_CACHE_TTL = 15 * 60
 
 
 # =====================================================
@@ -199,24 +201,15 @@ logger.info("YFINANCE VERSION: %s", yf.__version__)
 logger.info("عدد الأسهم في القائمة: %s", len(TICKERS))
 
 subscribers = set()
-
 active_trades = {}
-
 sent_today = set()
 
 daily_count = 0
-
 current_day = None
 
 last_scan_time = None
-
 last_scan_summary = {}
-
 last_scan_errors = []
-
-market_regime = "غير معروف"
-
-market_regime_details = ""
 
 scan_lock = asyncio.Lock()
 
@@ -252,12 +245,9 @@ def reset_daily_data_if_needed():
 
 def saudi_time_is_allowed():
 
-    current_time = now_saudi().time()
-
-    return (
-        current_time >= SAUDI_SCAN_START
-        or current_time < SAUDI_SCAN_END
-    )
+    # من الخامسة مساءً حتى منتصف الليل
+    # بعد منتصف الليل يصبح الوقت أقل من 17:00 تلقائيًا.
+    return now_saudi().time() >= SAUDI_SCAN_START
 
 
 def market_is_open():
@@ -267,9 +257,9 @@ def market_is_open():
     if now.weekday() >= 5:
         return False
 
-    return (
-        time(9, 30) <= now.time() < time(16, 0)
-    )
+    # يعتمد على أيام الأسبوع والساعات.
+    # لا يتضمن تقويم العطلات أو الإغلاق المبكر.
+    return time(9, 30) <= now.time() < time(16, 0)
 
 
 def market_is_open_for_scanning():
@@ -282,9 +272,7 @@ def market_is_open_for_scanning():
     if now.weekday() >= 5:
         return False
 
-    return (
-        START_SCAN_NY <= now.time() <= STOP_NEW_TRADES_NY
-    )
+    return START_SCAN_NY <= now.time() <= STOP_NEW_TRADES_NY
 
 
 def get_next_batch():
@@ -301,7 +289,6 @@ def get_next_batch():
     for i in range(min(SCAN_BATCH_SIZE, total)):
 
         index = (scan_cursor + i) % total
-
         batch.append(TICKERS[index])
 
     scan_cursor = (
@@ -360,7 +347,6 @@ def split_message(text, limit=3500):
 async def reply_long(update, text):
 
     for chunk in split_message(text):
-
         await update.message.reply_text(chunk)
 
 
@@ -408,7 +394,7 @@ def yahoo_history(ticker, period, interval):
                 )
 
                 logger.warning(
-                    "%s: لا توجد بيانات على %s، سيتم تخطيه مؤقتًا",
+                    "%s: لا توجد بيانات على %s",
                     ticker,
                     interval
                 )
@@ -416,6 +402,8 @@ def yahoo_history(ticker, period, interval):
                 raise NoDataError(
                     f"Yahoo لم يرجع بيانات {interval}"
                 )
+
+            NO_DATA_CACHE.pop(cache_key, None)
 
             return df
 
@@ -455,7 +443,6 @@ def calculate_rsi(series, period=14):
     delta = series.diff()
 
     gain = delta.clip(lower=0)
-
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
@@ -487,23 +474,17 @@ def prepare_dataframe(df, interval):
     ]
 
     if not all(col in df.columns for col in required):
-
         raise ValueError("أعمدة البيانات ناقصة")
 
     df = df[required].copy()
-
     df = df.dropna(subset=required)
 
     if not isinstance(df.index, pd.DatetimeIndex):
-
         raise ValueError("وقت الشموع غير صالح")
 
     if df.index.tz is None:
-
         df.index = df.index.tz_localize(TZ_NY)
-
     else:
-
         df.index = df.index.tz_convert(TZ_NY)
 
     df = df.sort_index()
@@ -514,21 +495,13 @@ def prepare_dataframe(df, interval):
     ]
 
     if df.empty:
-
         raise ValueError("لا توجد بيانات صالحة")
 
     # استبعاد الشمعة غير المكتملة للفريمات اللحظية
-    if interval == "5m":
-
-        minutes = 5
-
-    elif interval == "15m":
-
-        minutes = 15
-
-    else:
-
-        minutes = None
+    minutes = {
+        "5m": 5,
+        "15m": 15
+    }.get(interval)
 
     if minutes:
 
@@ -544,14 +517,11 @@ def prepare_dataframe(df, interval):
     if interval == "1d":
 
         today = now_ny().date()
+        df = df[df.index.date < today]
 
-        df = df[
-            df.index.date < today
-        ]
-
-    if len(df) < 22:
-
-        raise ValueError("عدد الشموع غير كافٍ")
+    # EMA50 يحتاج عددًا كافيًا من الشموع
+    if len(df) < 60:
+        raise ValueError("عدد الشموع غير كافٍ لحساب EMA50")
 
     df["EMA20"] = df["Close"].ewm(
         span=20,
@@ -597,7 +567,8 @@ def prepare_dataframe(df, interval):
         min_periods=10
     ).mean()
 
-    # ضغط الشراء والبيع التقديري
+    # ضغط شراء وبيع تقديري من موقع الإغلاق داخل الشمعة والحجم.
+    # لا يمثل بيانات دفتر الأوامر أو تدفق الأوامر الحقيقي.
     candle_range = (
         df["High"] - df["Low"]
     ).replace(0, float("nan"))
@@ -662,97 +633,7 @@ def calculate_vwap(df):
 
 
 # =====================================================
-# 8. تحديد حالة السوق
-# =====================================================
-
-def detect_market_regime(force=False):
-
-    global market_regime
-    global market_regime_details
-    global last_regime_check
-
-    current_timestamp = time_module.time()
-
-    if (
-        not force
-        and current_timestamp - last_regime_check
-        < REGIME_CACHE_TTL
-        and market_regime != "غير معروف"
-    ):
-
-        return market_regime
-
-    try:
-
-        df = yahoo_history(
-            "SPY",
-            "6mo",
-            "1d"
-        )
-
-        df = prepare_dataframe(
-            df,
-            "1d"
-        )
-
-        last = df.iloc[-1]
-
-        close = safe_float(last["Close"])
-
-        ema20 = safe_float(last["EMA20"])
-
-        ema50 = safe_float(last["EMA50"])
-
-        if any(
-            value is None
-            for value in [close, ema20, ema50]
-        ):
-
-            raise ValueError("مؤشرات SPY غير مكتملة")
-
-        if close > ema20 > ema50:
-
-            market_regime = "صاعد"
-
-        elif close < ema20 < ema50:
-
-            market_regime = "هابط"
-
-        else:
-
-            market_regime = "متذبذب"
-
-        market_regime_details = (
-            f"SPY={close:.2f} | "
-            f"EMA20={ema20:.2f} | "
-            f"EMA50={ema50:.2f}"
-        )
-
-        last_regime_check = current_timestamp
-
-        logger.info(
-            "حالة السوق: %s | %s",
-            market_regime,
-            market_regime_details
-        )
-
-        return market_regime
-
-    except Exception as e:
-
-        market_regime = "غير معروف"
-
-        market_regime_details = str(e)[:200]
-
-        logger.exception(
-            "تعذر تحديد حالة السوق"
-        )
-
-        return market_regime
-
-
-# =====================================================
-# 9. ضغط الشراء والبيع
+# 8. ضغط الشراء والبيع
 # =====================================================
 
 def calculate_pressure(df):
@@ -768,156 +649,227 @@ def calculate_pressure(df):
     )
 
     if buy is None or sell is None:
-
         return None, None
 
     total = buy + sell
 
     if total <= 0:
-
         return None, None
 
     buy_percent = buy / total * 100
-
     sell_percent = sell / total * 100
 
     return buy_percent, sell_percent
 
 
 # =====================================================
-# 10. تحليل استراتيجية واحدة
+# 9. حساب الأهداف ونسبة العائد للمخاطرة
 # =====================================================
 
-def evaluate_strategy(
-    ticker,
-    df,
-    style,
-    regime,
-    vwap=None
-):
+def calculate_trade_levels(entry, atr):
 
-    if df is None or len(df) < 22:
+    if entry <= 0 or atr <= 0:
+        return None
 
+    stop_distance = max(
+        atr * ATR_STOP_MULTIPLIER,
+        entry * 0.01
+    )
+
+    stop_percent = (
+        stop_distance / entry
+    ) * 100
+
+    if stop_percent > MAX_STOP_PERCENT:
+        return None
+
+    stop = round(entry - stop_distance, 2)
+
+    entry = round(entry, 2)
+
+    risk = entry - stop
+
+    if risk <= 0:
+        return None
+
+    # الهدف الأول: دولار واحد على الأقل أو 2R
+    target1_distance = max(
+        TARGET1_MIN_DOLLARS,
+        risk * TARGET1_R_MULTIPLE
+    )
+
+    # الهدف الثاني: دولاران على الأقل أو 3R
+    target2_distance = max(
+        TARGET2_MIN_DOLLARS,
+        risk * TARGET2_R_MULTIPLE
+    )
+
+    target1 = round(
+        entry + target1_distance,
+        2
+    )
+
+    target2 = round(
+        entry + target2_distance,
+        2
+    )
+
+    # فحص نسبة العائد للمخاطرة بعد التقريب
+    actual_risk = entry - stop
+
+    if actual_risk <= 0:
+        return None
+
+    actual_reward = target1 - entry
+
+    actual_rr = actual_reward / actual_risk
+
+    # رفع الهدف إذا تسبب التقريب في انخفاض النسبة عن 1:2
+    if actual_rr < MIN_RISK_REWARD:
+
+        target1 = round(
+            entry + actual_risk * MIN_RISK_REWARD + 0.01,
+            2
+        )
+
+        actual_reward = target1 - entry
+
+        actual_rr = actual_reward / actual_risk
+
+    if actual_rr < MIN_RISK_REWARD:
+        return None
+
+    # ضمان أن الهدف الثاني أعلى من الأول
+    if target2 <= target1:
+
+        target2 = round(
+            max(
+                entry + TARGET2_MIN_DOLLARS,
+                entry + actual_risk * TARGET2_R_MULTIPLE,
+                target1 + 0.01
+            ),
+            2
+        )
+
+    return {
+        "entry": entry,
+        "stop": stop,
+        "target1": target1,
+        "target2": target2,
+        "risk_reward": round(actual_rr, 2),
+        "risk": round(actual_risk, 2)
+    }
+
+
+# =====================================================
+# 10. تحليل استراتيجية واحدة لكل سهم
+# =====================================================
+
+def evaluate_strategy(ticker, df, style, vwap=None):
+
+    if df is None or len(df) < 60:
         return None
 
     last = df.iloc[-1]
-
     previous = df.iloc[-2]
 
     entry = safe_float(last["Close"])
-
     ema20 = safe_float(last["EMA20"])
-
     ema50 = safe_float(last["EMA50"])
-
     rsi = safe_float(last["RSI"])
-
-    volume_ratio = safe_float(
-        last["Volume_Ratio"]
-    )
-
+    volume_ratio = safe_float(last["Volume_Ratio"])
     atr = safe_float(last["ATR"])
 
-    if any(
-        value is None
-        for value in [
-            entry,
-            ema20,
-            ema50,
-            rsi,
-            volume_ratio,
-            atr
-        ]
-    ):
+    previous_ema50 = safe_float(previous["EMA50"])
+    previous_close = safe_float(previous["Close"])
 
+    if any(value is None for value in [
+        entry,
+        ema20,
+        ema50,
+        rsi,
+        volume_ratio,
+        atr,
+        previous_ema50,
+        previous_close
+    ]):
         return None
 
+    # نطاق السعر المطلوب
     if not MIN_STOCK_PRICE <= entry <= MAX_STOCK_PRICE:
-
         return None
 
     if atr <= 0:
-
         return None
 
     buy_pressure, sell_pressure = calculate_pressure(df)
 
-    if buy_pressure is None:
+    if buy_pressure is None or sell_pressure is None:
+        return None
 
+    # اتجاه السهم نفسه فقط.
+    # لا توجد أي شروط مرتبطة بحركة سهم آخر أو السوق العام.
+    bullish_setup = (
+        (entry > ema20 and ema20 >= ema50)
+        or (
+            entry > ema20
+            and buy_pressure >= 65
+            and entry > previous_close
+        )
+    )
+
+    if not bullish_setup:
         return None
 
     score = 0
-
     reasons = []
 
     # الاتجاه الفني: نقطتان
-
     if entry > ema20:
-
         score += 1
-
         reasons.append("السعر فوق EMA20")
 
     if ema20 > ema50:
-
         score += 1
-
         reasons.append("EMA20 فوق EMA50")
 
-    # VWAP: نقطة
-
+    # تأكيد الاتجاه: نقطة واحدة
     if style in ("سكالبينج", "تداول يومي"):
 
         if vwap is not None and entry > vwap:
-
             score += 1
-
             reasons.append("السعر فوق VWAP")
 
     else:
 
-        if entry > ema20:
-
+        if ema50 > previous_ema50:
             score += 1
+            reasons.append("ميل EMA50 صاعد")
 
     # حجم التداول: نقطتان
-
     if volume_ratio >= 1.5:
-
         score += 2
-
         reasons.append("حجم تداول مرتفع")
 
     elif volume_ratio >= 1.0:
-
         score += 1
-
         reasons.append("حجم تداول مقبول")
 
-    # RSI: نقطة
-
+    # RSI: نقطة واحدة
     if 48 <= rsi <= 68:
-
         score += 1
-
-        reasons.append("RSI مناسب")
+        reasons.append("RSI ضمن النطاق الإيجابي")
 
     # ضغط الشراء: نقطتان
-
     if buy_pressure >= 65:
-
         score += 2
-
-        reasons.append("ضغط شراء قوي")
+        reasons.append("ضغط شراء تقديري قوي")
 
     elif buy_pressure >= 55:
-
         score += 1
-
-        reasons.append("ضغط شراء إيجابي")
+        reasons.append("ضغط شراء تقديري إيجابي")
 
     # الدعم والمقاومة: نقطتان
-
     previous_bars = df.iloc[-21:-1]
 
     support = safe_float(
@@ -930,7 +882,11 @@ def evaluate_strategy(
 
     structure_score = 0
 
-    if support and resistance and resistance > support:
+    if (
+        support is not None
+        and resistance is not None
+        and resistance > support
+    ):
 
         distance_support = (
             entry - support
@@ -940,144 +896,83 @@ def evaluate_strategy(
             resistance - entry
         ) / entry
 
-        previous_close = safe_float(
-            previous["Close"]
-        )
-
-        # ارتداد من الدعم
-
+        # ارتداد صاعد من منطقة دعم
         if (
-            distance_support <= 0.025
-            and previous_close is not None
+            0 <= distance_support <= 0.025
             and entry > previous_close
         ):
 
             structure_score = 2
+            reasons.append("ارتداد صاعد من منطقة دعم")
 
-            reasons.append("ارتداد من منطقة دعم")
-
-        # اختراق المقاومة
-
+        # اختراق مقاومة
         elif (
             entry > resistance
-            and previous_close is not None
             and entry > previous_close
         ):
 
             structure_score = 2
+            reasons.append("اختراق مقاومة سابقة")
 
-            reasons.append("اختراق مقاومة")
-
+        # مساحة فنية فوق السعر
         elif (
             entry > ema20
             and distance_resistance > 0.02
         ):
 
             structure_score = 1
-
-            reasons.append("مساحة صعود متاحة")
+            reasons.append("توجد مساحة فنية فوق السعر")
 
     score += structure_score
 
-    # حالة السوق
-
-    if regime == "هابط":
-
-        if style != "سوينغ":
-
-            return None
-
-        if not (
-            entry > ema20
-            and buy_pressure >= 65
-            and score >= 8
-        ):
-
-            return None
-
-        reasons.append("ارتداد انتقائي في سوق هابط")
-
-    elif regime == "متذبذب":
-
-        if structure_score < 2:
-
-            return None
-
-        reasons.append("استراتيجية سوق متذبذب")
-
-    elif regime == "غير معروف":
-
-        return None
-
-    # وقف الخسارة
-
-    stop_distance = max(
-        atr * ATR_STOP_MULTIPLIER,
-        entry * 0.01
-    )
-
-    stop = entry - stop_distance
-
-    stop_percent = (
-        stop_distance / entry
-    ) * 100
-
-    if stop_percent > MAX_STOP_PERCENT:
-
-        return None
-
-    if stop <= 0:
-
-        return None
-
-    risk = entry - stop
-
-    # الأهداف
-
-    target1 = entry + (risk * 2)
-
-    target2 = entry + (risk * 3)
-
-    rr = (target1 - entry) / risk
-
-    if rr < MIN_RISK_REWARD:
-
-        return None
+    # الحد الأقصى للتقييم 10 نقاط
+    score = min(score, 10)
 
     if score < MIN_SCORE:
+        return None
 
+    # حساب وقف الخسارة والأهداف
+    levels = calculate_trade_levels(entry, atr)
+
+    if levels is None:
         return None
 
     return {
         "ticker": ticker,
         "style": style,
         "score": score,
-        "entry": round(entry, 2),
-        "stop": round(stop, 2),
-        "target1": round(target1, 2),
-        "target2": round(target2, 2),
-        "risk_reward": round(rr, 2),
+
+        "entry": levels["entry"],
+        "stop": levels["stop"],
+        "target1": levels["target1"],
+        "target2": levels["target2"],
+
+        "risk_reward": levels["risk_reward"],
+        "risk": levels["risk"],
+
         "rsi": round(rsi, 1),
         "volume_ratio": round(volume_ratio, 2),
+
         "buy_pressure": round(buy_pressure, 1),
         "sell_pressure": round(sell_pressure, 1),
+
         "atr": round(atr, 3),
-        "support": round(support, 2) if support else None,
-        "resistance": round(resistance, 2) if resistance else None,
-        "regime": regime,
+
+        "support": round(support, 2) if support is not None else None,
+        "resistance": round(resistance, 2) if resistance is not None else None,
+
         "reasons": reasons,
         "timestamp": now_saudi()
     }
 
 
 # =====================================================
-# 11. تحليل السهم بجميع الاستراتيجيات
+# 11. تحليل السهم بالاستراتيجيات الثلاث
 # =====================================================
 
-def analyze_ticker(ticker, regime):
+def analyze_ticker(ticker):
 
     results = []
-
     errors = []
 
     configurations = [
@@ -1102,33 +997,30 @@ def analyze_ticker(ticker, regime):
 
         try:
 
-            df = yahoo_history(
+            raw = yahoo_history(
                 ticker,
                 config["period"],
                 config["interval"]
             )
 
             df = prepare_dataframe(
-                df,
+                raw,
                 config["interval"]
             )
 
             vwap = None
 
             if config["interval"] in ("5m", "15m"):
-
                 vwap = calculate_vwap(df)
 
             result = evaluate_strategy(
-                ticker,
-                df,
-                config["style"],
-                regime,
-                vwap
+                ticker=ticker,
+                df=df,
+                style=config["style"],
+                vwap=vwap
             )
 
             if result:
-
                 results.append(result)
 
         except NoDataError as e:
@@ -1179,6 +1071,9 @@ def analyze_ticker(ticker, regime):
 
 def trade_message(trade):
 
+    profit1 = trade["target1"] - trade["entry"]
+    profit2 = trade["target2"] - trade["entry"]
+
     return (
         "🚀 فرصة شراء أسهم أمريكية\n\n"
 
@@ -1200,6 +1095,10 @@ def trade_message(trade):
 
         f"🎯 الهدف الثاني: ${trade['target2']:.2f}\n\n"
 
+        f"💰 ربح الهدف الأول النظري: ${profit1:.2f} للسهم\n"
+
+        f"💰 ربح الهدف الثاني النظري: ${profit2:.2f} للسهم\n\n"
+
         "📈 المؤشرات\n"
 
         f"ضغط الشراء التقديري: {trade['buy_pressure']:.1f}%\n"
@@ -1210,9 +1109,7 @@ def trade_message(trade):
 
         f"حجم التداول: {trade['volume_ratio']}x\n"
 
-        f"حالة السوق: {trade['regime']}\n"
-
-        f"العائد للمخاطرة: 1:{trade['risk_reward']:.1f}\n\n"
+        f"العائد للمخاطرة: 1:{trade['risk_reward']:.2f}\n\n"
 
         "🔍 أسباب الترشيح:\n"
 
@@ -1226,7 +1123,8 @@ def trade_message(trade):
         f"🕒 وقت التحليل: "
         f"{trade['timestamp'].strftime('%H:%M:%S')} السعودية\n\n"
 
-        "⚠️ هذه إشارة تحليلية وليست أمر تنفيذ. "
+        "⚠️ الأهداف حسابية وليست ضمانًا للوصول إليها، "
+        "وقد تتجاوز مقاومة فنية قريبة. "
         "تحقق من السعر قبل الشراء؛ إذا ابتعد السعر "
         "عن الدخول بأكثر من 0.3% فلا تطارد السهم."
     )
@@ -1374,11 +1272,9 @@ def get_current_price(ticker):
 
             last_timestamp = last_timestamp.tz_convert(TZ_NY)
 
-        # لا نعتمد على سعر قديم من جلسة سابقة
         if last_timestamp.date() != now_ny().date():
             return None
 
-        # لا نعتمد على سعر متأخر أكثر من 10 دقائق
         age = now_ny() - last_timestamp
 
         if age > timedelta(minutes=10):
@@ -1419,10 +1315,9 @@ async def monitor_trades(application):
 
     now = now_ny()
 
-    # لا نطلب أسعارًا خارج الجلسة الأمريكية
+    # متابعة الصفقات اليومية خلال الجلسة فقط
     if not market_is_open():
 
-        # إغلاق متابعة صفقات اليوم عند نهاية الجلسة
         if now.time() >= CLOSE_ALL_TIME_NY:
 
             for ticker in list(active_trades.keys()):
@@ -1436,7 +1331,7 @@ async def monitor_trades(application):
 
                     await send_to_subscribers(
                         application,
-                        f"⏰ انتهت جلسة التداول\n"
+                        "⏰ انتهت جلسة التداول\n"
                         f"السهم: {ticker}\n"
                         "انتهت متابعة الصفقة اليومية."
                     )
@@ -1459,7 +1354,7 @@ async def monitor_trades(application):
 
             await send_to_subscribers(
                 application,
-                f"⏰ انتهت جلسة التداول\n"
+                "⏰ انتهت جلسة التداول\n"
                 f"السهم: {ticker}\n"
                 "انتهت متابعة الصفقة اليومية."
             )
@@ -1477,15 +1372,11 @@ async def monitor_trades(application):
             continue
 
         entry = trade["entry"]
-
         stop = trade["stop"]
-
         target1 = trade["target1"]
-
         target2 = trade["target2"]
 
         # وقف الخسارة
-
         if price <= stop and not trade["stop_sent"]:
 
             trade["stop_sent"] = True
@@ -1504,7 +1395,6 @@ async def monitor_trades(application):
             continue
 
         # الهدف الثاني
-
         if price >= target2 and not trade["tp2_sent"]:
 
             trade["tp2_sent"] = True
@@ -1523,7 +1413,6 @@ async def monitor_trades(application):
             continue
 
         # الهدف الأول
-
         if price >= target1 and not trade["tp1_sent"]:
 
             trade["tp1_sent"] = True
@@ -1539,6 +1428,33 @@ async def monitor_trades(application):
             )
 
 
+async def monitor_loop(application):
+
+    logger.info(
+        "بدأت متابعة الصفقات كل %s ثانية",
+        MONITOR_INTERVAL
+    )
+
+    while True:
+
+        try:
+
+            reset_daily_data_if_needed()
+
+            await monitor_trades(application)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+
+            logger.exception(
+                "خطأ في متابعة الصفقات"
+            )
+
+        await asyncio.sleep(MONITOR_INTERVAL)
+
+
 # =====================================================
 # 17. محرك الفحص
 # =====================================================
@@ -1552,7 +1468,6 @@ async def run_scan(application, manual=False):
     reset_daily_data_if_needed()
 
     if scan_lock.locked():
-
         return "يوجد فحص آخر قيد التنفيذ."
 
     async with scan_lock:
@@ -1560,7 +1475,6 @@ async def run_scan(application, manual=False):
         last_scan_time = now_saudi()
 
         summary = {}
-
         errors = []
 
         if not market_is_open_for_scanning():
@@ -1570,7 +1484,7 @@ async def run_scan(application, manual=False):
                 f"الوقت السعودي: {now_saudi().strftime('%H:%M:%S')}\n"
                 "نافذة الفحص: 5:00 مساءً إلى 12:00 منتصف الليل.\n"
                 f"وقت نيويورك: {now_ny().strftime('%H:%M:%S')}\n"
-                "يشترط أن يكون السوق الأمريكي مفتوحًا."
+                "يشترط أن يكون السوق الأمريكي ضمن ساعات الفحص."
             )
 
         if daily_count >= MAX_PER_DAY:
@@ -1580,24 +1494,10 @@ async def run_scan(application, manual=False):
                 f"{MAX_PER_DAY} فرص."
             )
 
-        # تحديد حالة السوق
-        regime = await asyncio.to_thread(
-            detect_market_regime
-        )
-
-        if regime == "غير معروف":
-
-            return (
-                "تعذر تحديد حالة السوق من SPY.\n"
-                "تم إيقاف إرسال الفرص احترازيًا.\n"
-                f"{market_regime_details}"
-            )
-
         batch = get_next_batch()
 
         logger.info(
-            "بدء فحص دفعة جديدة | حالة السوق: %s | عدد الأسهم: %s",
-            regime,
+            "بدء فحص دفعة مستقلة | عدد الأسهم: %s",
             len(batch)
         )
 
@@ -1611,21 +1511,19 @@ async def run_scan(application, manual=False):
             if ticker in sent_today:
 
                 summary[ticker] = "تم إرسال فرصة اليوم"
-
                 continue
 
             if ticker in active_trades:
 
                 summary[ticker] = "صفقة نشطة"
-
                 continue
 
             try:
 
+                # تحليل السهم مستقلًا
                 analysis = await asyncio.to_thread(
                     analyze_ticker,
-                    ticker,
-                    regime
+                    ticker
                 )
 
                 if not analysis.get("signal"):
@@ -1646,10 +1544,6 @@ async def run_scan(application, manual=False):
 
                     continue
 
-                opportunity = analysis
-
-                # تأكيد السعر الحالي
-
                 current_price = await asyncio.to_thread(
                     get_current_price,
                     ticker
@@ -1663,7 +1557,7 @@ async def run_scan(application, manual=False):
 
                     continue
 
-                entry = opportunity["entry"]
+                entry = analysis["entry"]
 
                 deviation = abs(
                     current_price - entry
@@ -1680,14 +1574,14 @@ async def run_scan(application, manual=False):
 
                 sent = await open_trade(
                     application,
-                    opportunity
+                    analysis
                 )
 
                 if sent:
 
                     summary[ticker] = (
-                        f"تم إرسال فرصة {opportunity['style']} "
-                        f"| التقييم {opportunity['score']}/10"
+                        f"تم إرسال فرصة {analysis['style']} "
+                        f"| التقييم {analysis['score']}/10"
                     )
 
                 else:
@@ -1721,12 +1615,11 @@ async def run_scan(application, manual=False):
                 )
 
         last_scan_summary = summary
-
         last_scan_errors = errors
 
         report = (
             "📊 انتهى فحص الدفعة\n\n"
-            f"حالة السوق: {regime}\n"
+            "طريقة التحليل: كل سهم مستقل.\n"
             f"الفرص المرسلة: {daily_count}/{MAX_PER_DAY}\n"
             f"الأسهم في هذه الدفعة: {len(summary)}\n"
             f"إجمالي الأسهم في القائمة: {len(TICKERS)}\n"
@@ -1761,10 +1654,7 @@ async def scanner_loop(application):
                     manual=False
                 )
 
-            await monitor_trades(application)
-
         except asyncio.CancelledError:
-
             raise
 
         except Exception:
@@ -1803,10 +1693,13 @@ async def start_command(update, context):
         "قوة الإشارة\n"
         "العائد للمخاطرة\n\n"
 
+        "🎯 الهدف الأول: دولار واحد على الأقل أو 2R.\n"
+        "🎯 الهدف الثاني: دولاران على الأقل أو 3R.\n\n"
+
+        "كل سهم يُحلل بصورة مستقلة.\n\n"
+
         "🕒 وقت الفحص بتوقيت السعودية:\n"
         "من 5:00 مساءً إلى 12:00 منتصف الليل.\n\n"
-
-        "يتم فحص الأسهم على دفعات متتابعة.\n\n"
 
         "الأوامر:\n"
         "/scan - فحص دفعة من الأسهم\n"
@@ -1847,7 +1740,8 @@ async def status_command(update, context):
     await update.message.reply_text(
         "📊 حالة Aboghala Bot\n\n"
 
-        "الحالة: يعمل\n\n"
+        "الحالة: يعمل\n"
+        "تحليل الأسهم: مستقل لكل سهم\n\n"
 
         f"وقت السعودية: {now_saudi().strftime('%Y-%m-%d %H:%M:%S')}\n"
 
@@ -1855,15 +1749,14 @@ async def status_command(update, context):
 
         f"آخر فحص: {last_scan}\n\n"
 
-        f"حالة السوق: {market_regime}\n"
-
-        f"{market_regime_details}\n\n"
-
         f"سعر الأسهم: {MIN_STOCK_PRICE}$ - {MAX_STOCK_PRICE}$\n"
 
         f"الحد الأدنى للتقييم: {MIN_SCORE}/10\n"
 
-        f"العائد للمخاطرة: 1:{MIN_RISK_REWARD:.1f}\n\n"
+        f"العائد للمخاطرة: 1:{MIN_RISK_REWARD:.1f} على الأقل\n\n"
+
+        "الهدف الأول: دولار واحد أو 2R أيهما أكبر\n"
+        "الهدف الثاني: دولاران أو 3R أيهما أكبر\n\n"
 
         f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}\n"
 
@@ -1875,7 +1768,9 @@ async def status_command(update, context):
 
         f"حجم الدفعة: {SCAN_BATCH_SIZE}\n"
 
-        f"الفحص كل: {SCAN_INTERVAL // 60} دقائق تقريبًا\n\n"
+        f"الفحص كل: {SCAN_INTERVAL // 60} دقائق تقريبًا\n"
+
+        f"متابعة الصفقات كل: {MONITOR_INTERVAL} ثانية\n\n"
 
         f"الفحص التلقائي: "
         f"{'نعم' if market_is_open_for_scanning() else 'لا'}\n\n"
@@ -1897,7 +1792,7 @@ async def report_command(update, context):
     lines = [
         "📋 تقرير آخر فحص",
         f"الوقت السعودي: {last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"حالة السوق: {market_regime}",
+        "طريقة التحليل: كل سهم مستقل.",
         f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}",
         f"عدد الأسهم في القائمة: {len(TICKERS)}",
         ""
@@ -1912,7 +1807,6 @@ async def report_command(update, context):
     if last_scan_errors:
 
         lines.append("\nالأخطاء:")
-
         lines.extend(last_scan_errors)
 
     await reply_long(
@@ -1934,7 +1828,7 @@ async def debug_command(update, context):
     lines = [
         "🔬 تشخيص الأسهم\n",
 
-        f"حالة السوق: {market_regime}",
+        "تحليل مستقل لكل سهم.",
 
         f"نطاق السعر: {MIN_STOCK_PRICE}$–{MAX_STOCK_PRICE}$",
 
@@ -1948,7 +1842,7 @@ async def debug_command(update, context):
 
         f"عدد الأسهم: {len(TICKERS)}",
 
-        f"وقت الفحص: 17:00–00:00 السعودية",
+        "وقت الفحص: 17:00–00:00 السعودية",
 
         ""
     ]
@@ -1987,7 +1881,7 @@ async def active_command(update, context):
             f"الهدف الثاني: ${trade['target2']:.2f}\n"
             f"وقف الخسارة: ${trade['stop']:.2f}\n"
             f"التقييم: {trade['score']}/10\n"
-            f"العائد للمخاطرة: 1:{trade['risk_reward']:.1f}"
+            f"العائد للمخاطرة: 1:{trade['risk_reward']:.2f}"
         )
 
     await reply_long(
@@ -2019,8 +1913,12 @@ async def post_init(application):
         scanner_loop(application)
     )
 
+    application.create_task(
+        monitor_loop(application)
+    )
+
     logger.info(
-        "تم تشغيل محرك الأسهم"
+        "تم تشغيل محرك الأسهم ومتابعة الصفقات"
     )
 
 
@@ -2055,11 +1953,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         else:
 
             self.send_response(404)
-
             self.end_headers()
 
     def log_message(self, format, *args):
-
         return
 
 
@@ -2145,5 +2041,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
