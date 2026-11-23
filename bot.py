@@ -1,8 +1,5 @@
 import os
 import asyncio
-import yfinance as yf
-print("YFINANCE VERSION:", yf.__version__)
-print("YFINANCE VERSION:", yf.__version__)
 import logging
 import threading
 import math
@@ -25,8 +22,7 @@ from telegram.ext import Application, CommandHandler
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-NY_TZ = ZoneInfo("America/New_York")
-SA_TZ = ZoneInfo("Asia/Riyadh")
+TZ = ZoneInfo("America/New_York")
 
 TICKERS = [
     "SPY", "QQQ", "IWM", "DIA",
@@ -41,13 +37,9 @@ TICKERS = [
 MAX_PER_DAY = 10
 SCAN_INTERVAL = 60
 
-# فترة تشغيل البوت بتوقيت السعودية
-SAUDI_START = time(17, 0)
-SAUDI_END = time(0, 0)
-
-# جلسة السوق الأمريكية بتوقيت نيويورك
-MARKET_OPEN = time(9, 30)
-MARKET_CLOSE = time(16, 0)
+START_SCAN = time(9, 40)
+STOP_NEW_TRADES = time(16, 0)
+CLOSE_ALL_TIME = time(16, 0)
 
 # شروط العقد
 MIN_OPTION_PRICE = 0.10
@@ -56,8 +48,9 @@ MIN_OPTION_VOLUME = 10
 MAX_SPREAD_PERCENT = 20
 MAX_OPTION_TRADE_AGE_MINUTES = 20
 
-# شروط الاستراتيجية المخففة
-MIN_VOLUME_RATIO = 0.5
+# شروط الاستراتيجية
+MIN_VOLUME_RATIO = 0.8
+MIN_DIRECTION_SCORE = 2
 
 CALL_RSI_MIN = 45
 CALL_RSI_MAX = 75
@@ -73,8 +66,18 @@ STOP_LOSS = -0.35
 MAX_5M_CANDLE_AGE_MINUTES = 15
 MAX_15M_CANDLE_AGE_MINUTES = 25
 
-YAHOO_RETRIES = 3
-YAHOO_RETRY_DELAY = 2
+# إعدادات Yahoo
+YAHOO_RETRIES = 4
+YAHOO_RETRY_DELAY = 3
+
+# حفظ تواريخ الانتهاء لمدة 15 دقيقة
+OPTION_EXPIRATIONS_CACHE_TTL = 900
+
+# منع طلبات الخيارات المتزامنة
+OPTION_REQUEST_LOCK = threading.RLock()
+
+# تخزين تواريخ الانتهاء
+OPTION_EXPIRATIONS_CACHE = {}
 
 
 # =====================================================
@@ -87,6 +90,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("AboghalaBot")
+
+logger.info("YFINANCE VERSION: %s", yf.__version__)
 
 subscribers = set()
 active_trades = {}
@@ -115,11 +120,7 @@ scan_lock = asyncio.Lock()
 # =====================================================
 
 def now_ny():
-    return datetime.now(NY_TZ)
-
-
-def now_saudi():
-    return datetime.now(SA_TZ)
+    return datetime.now(TZ)
 
 
 def reset_daily_data_if_needed():
@@ -130,7 +131,6 @@ def reset_daily_data_if_needed():
     global strong_seen_today
     global medium_seen_today
 
-    # اليوم التشغيلي مرتبط بتاريخ نيويورك
     today = now_ny().date()
 
     if current_day != today:
@@ -142,22 +142,17 @@ def reset_daily_data_if_needed():
         strong_seen_today = set()
         medium_seen_today = set()
 
-        logger.info(
-            "تم تصفير إحصائيات اليوم الجديد: %s",
-            today
-        )
+        logger.info("تم تصفير إحصائيات اليوم الجديد")
 
 
-def inside_saudi_schedule():
+def market_is_open_for_scanning():
 
-    current = now_saudi().time()
+    now = now_ny()
 
-    # الفترة من 17:00 إلى 00:00
-    # أضفنا دقيقة سماح عند منتصف الليل
-    return (
-        current >= SAUDI_START
-        or current < time(0, 1)
-    )
+    if now.weekday() >= 5:
+        return False
+
+    return START_SCAN <= now.time() <= STOP_NEW_TRADES
 
 
 def market_is_open():
@@ -167,15 +162,7 @@ def market_is_open():
     if now.weekday() >= 5:
         return False
 
-    return MARKET_OPEN <= now.time() < MARKET_CLOSE
-
-
-def market_is_open_for_scanning():
-
-    return (
-        inside_saudi_schedule()
-        and market_is_open()
-    )
+    return time(9, 30) <= now.time() <= time(16, 0)
 
 
 # =====================================================
@@ -248,23 +235,201 @@ def yahoo_call(function, description="Yahoo"):
                 description,
                 attempt + 1,
                 YAHOO_RETRIES,
-                str(e)[:180]
+                str(e)[:250]
             )
 
             if attempt < YAHOO_RETRIES - 1:
 
-                time_module.sleep(
-                    YAHOO_RETRY_DELAY * (attempt + 1)
-                )
+                delay = YAHOO_RETRY_DELAY * (attempt + 1)
+
+                time_module.sleep(delay)
 
     raise RuntimeError(
         f"{description}: فشلت جميع المحاولات: "
-        f"{str(last_error)[:200]}"
+        f"{str(last_error)[:250]}"
     )
 
 
 # =====================================================
-# 5. اختبار Yahoo
+# 5. جلب تواريخ انتهاء الأوبشن - معالجة جديدة
+# =====================================================
+
+def get_option_expirations(ticker, force_refresh=False):
+
+    """
+    يجلب تواريخ انتهاء الأوبشن.
+
+    - يعيد المحاولة عند القائمة الفارغة.
+    - ينشئ Ticker جديدًا في كل محاولة.
+    - يخزن النتيجة الصحيحة مؤقتًا.
+    - لا يخزن النتائج الفارغة.
+    """
+
+    ticker = ticker.upper().strip()
+
+    now_timestamp = time_module.time()
+
+    with OPTION_REQUEST_LOCK:
+
+        cached = OPTION_EXPIRATIONS_CACHE.get(ticker)
+
+        if not force_refresh and cached:
+
+            cached_expirations = cached["expirations"]
+            cached_time = cached["timestamp"]
+
+            cache_age = now_timestamp - cached_time
+
+            if (
+                cached_expirations
+                and cache_age < OPTION_EXPIRATIONS_CACHE_TTL
+            ):
+
+                logger.info(
+                    "%s: استخدام تواريخ الانتهاء المخزنة مؤقتًا",
+                    ticker
+                )
+
+                return cached_expirations
+
+        last_error = None
+
+        for attempt in range(1, YAHOO_RETRIES + 1):
+
+            try:
+
+                logger.info(
+                    "%s: طلب تواريخ الانتهاء، المحاولة %s/%s",
+                    ticker,
+                    attempt,
+                    YAHOO_RETRIES
+                )
+
+                # إنشاء كائن جديد في كل محاولة
+                stock = yf.Ticker(ticker)
+
+                expirations = stock.options
+
+                if expirations is None:
+
+                    raise ValueError(
+                        "Yahoo أعاد None بدل تواريخ الانتهاء"
+                    )
+
+                expirations = tuple(
+                    sorted({
+                        str(expiration)
+                        for expiration in expirations
+                        if expiration
+                    })
+                )
+
+                # النقطة المهمة:
+                # القائمة الفارغة تعتبر فشلًا وتؤدي لإعادة المحاولة
+                if not expirations:
+
+                    raise ValueError(
+                        "Yahoo أعاد قائمة تواريخ انتهاء فارغة"
+                    )
+
+                # التأكد من صيغة التواريخ
+                valid_expirations = []
+
+                for expiration in expirations:
+
+                    try:
+
+                        datetime.strptime(
+                            expiration,
+                            "%Y-%m-%d"
+                        )
+
+                        valid_expirations.append(expiration)
+
+                    except ValueError:
+                        logger.warning(
+                            "%s: تاريخ انتهاء غير صالح: %s",
+                            ticker,
+                            expiration
+                        )
+
+                if not valid_expirations:
+
+                    raise ValueError(
+                        "Yahoo أعاد تواريخ لكن صيغتها غير صالحة"
+                    )
+
+                valid_expirations = tuple(valid_expirations)
+
+                # تخزين النتيجة الصحيحة
+                OPTION_EXPIRATIONS_CACHE[ticker] = {
+                    "expirations": valid_expirations,
+                    "timestamp": time_module.time()
+                }
+
+                logger.info(
+                    "%s: نجح جلب %s تاريخ انتهاء: %s",
+                    ticker,
+                    len(valid_expirations),
+                    ", ".join(valid_expirations[:5])
+                )
+
+                return valid_expirations
+
+            except Exception as e:
+
+                last_error = str(e)
+
+                logger.warning(
+                    "%s: فشل جلب تواريخ الانتهاء "
+                    "(المحاولة %s/%s): %s",
+                    ticker,
+                    attempt,
+                    YAHOO_RETRIES,
+                    last_error[:250]
+                )
+
+                if attempt < YAHOO_RETRIES:
+
+                    delay = YAHOO_RETRY_DELAY * attempt
+
+                    logger.info(
+                        "%s: إعادة المحاولة بعد %s ثوانٍ",
+                        ticker,
+                        delay
+                    )
+
+                    time_module.sleep(delay)
+
+        raise RuntimeError(
+            f"Yahoo لم يرجع تواريخ انتهاء لـ {ticker} "
+            f"بعد {YAHOO_RETRIES} محاولات. "
+            f"آخر نتيجة: {last_error}"
+        )
+
+
+# =====================================================
+# 6. جلب سلسلة عقود الأوبشن
+# =====================================================
+
+def get_option_chain(ticker, expiration):
+
+    """
+    جلب سلسلة العقود مع تنظيم الطلبات.
+    """
+
+    with OPTION_REQUEST_LOCK:
+
+        stock = yf.Ticker(ticker)
+
+        return yahoo_call(
+            lambda: stock.option_chain(expiration),
+            f"سلسلة خيارات {ticker} بتاريخ {expiration}"
+        )
+
+
+# =====================================================
+# 7. اختبار Yahoo
 # =====================================================
 
 def test_yahoo_connection():
@@ -273,25 +438,25 @@ def test_yahoo_connection():
 
     try:
 
-        stock = yf.Ticker("SPY")
-
-        expirations = yahoo_call(
-            lambda: stock.options,
-            "اختبار تواريخ Yahoo"
+        expirations = get_option_expirations(
+            "SPY",
+            force_refresh=True
         )
-
-        if not expirations:
-            raise RuntimeError(
-                "Yahoo لم يرجع تواريخ انتهاء لعقود SPY"
-            )
 
         yahoo_status = {
             "ok": True,
             "message": (
-                f"الاتصال يعمل، تواريخ الانتهاء: "
-                f"{len(expirations)}"
+                f"الاتصال يعمل. "
+                f"عدد تواريخ SPY: {len(expirations)}. "
+                f"أقرب التواريخ: "
+                f"{', '.join(expirations[:5])}"
             )
         }
+
+        logger.info(
+            "اختبار Yahoo ناجح: %s",
+            yahoo_status["message"]
+        )
 
         return True
 
@@ -299,19 +464,19 @@ def test_yahoo_connection():
 
         yahoo_status = {
             "ok": False,
-            "message": str(e)[:250]
+            "message": str(e)[:350]
         }
 
         logger.error(
             "فشل اختبار Yahoo: %s",
-            str(e)[:250]
+            str(e)[:350]
         )
 
         return False
 
 
 # =====================================================
-# 6. حساب RSI
+# 8. حساب RSI
 # =====================================================
 
 def calculate_rsi(series, period=14):
@@ -339,7 +504,7 @@ def calculate_rsi(series, period=14):
 
 
 # =====================================================
-# 7. تجهيز الشموع والمؤشرات
+# 9. تجهيز الشموع والمؤشرات
 # =====================================================
 
 def prepare_candles(ticker, interval):
@@ -371,19 +536,15 @@ def prepare_candles(ticker, interval):
     ]
 
     if missing:
-        raise ValueError(
-            f"أعمدة ناقصة: {missing}"
-        )
+        raise ValueError(f"أعمدة ناقصة: {missing}")
 
     if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError(
-            "تنسيق وقت الشموع غير صالح"
-        )
+        raise ValueError("تنسيق وقت الشموع غير صالح")
 
     if df.index.tz is None:
-        df.index = df.index.tz_localize(NY_TZ)
+        df.index = df.index.tz_localize(TZ)
     else:
-        df.index = df.index.tz_convert(NY_TZ)
+        df.index = df.index.tz_convert(TZ)
 
     df = df.sort_index()
     df = df[required].copy()
@@ -395,9 +556,7 @@ def prepare_candles(ticker, interval):
     ]
 
     if df.empty:
-        raise ValueError(
-            "بيانات الشموع غير صالحة"
-        )
+        raise ValueError("بيانات الشموع غير صالحة")
 
     now = now_ny()
 
@@ -412,9 +571,7 @@ def prepare_candles(ticker, interval):
     ]
 
     if df.empty:
-        raise ValueError(
-            "لا توجد شموع مكتملة"
-        )
+        raise ValueError("لا توجد شموع مكتملة")
 
     last_candle_close = (
         df.index[-1] + timedelta(minutes=minutes)
@@ -442,10 +599,7 @@ def prepare_candles(ticker, interval):
         adjust=False
     ).mean()
 
-    df["RSI"] = calculate_rsi(
-        df["Close"],
-        14
-    )
+    df["RSI"] = calculate_rsi(df["Close"], 14)
 
     df["Volume_Avg"] = df["Volume"].rolling(
         20,
@@ -454,10 +608,7 @@ def prepare_candles(ticker, interval):
 
     df["Volume_Ratio"] = (
         df["Volume"]
-        / df["Volume_Avg"].replace(
-            0,
-            float("nan")
-        )
+        / df["Volume_Avg"].replace(0, float("nan"))
     )
 
     today = now.date()
@@ -467,9 +618,7 @@ def prepare_candles(ticker, interval):
     ].copy()
 
     if today_df.empty:
-        raise ValueError(
-            "لا توجد شموع لليوم الحالي"
-        )
+        raise ValueError("لا توجد شموع لليوم الحالي")
 
     typical_price = (
         today_df["High"]
@@ -477,14 +626,10 @@ def prepare_candles(ticker, interval):
         + today_df["Close"]
     ) / 3
 
-    cumulative_volume = (
-        today_df["Volume"].cumsum()
-    )
+    cumulative_volume = today_df["Volume"].cumsum()
 
     if cumulative_volume.iloc[-1] <= 0:
-        raise ValueError(
-            "حجم التداول غير صالح لحساب VWAP"
-        )
+        raise ValueError("حجم التداول غير صالح لحساب VWAP")
 
     today_df["VWAP"] = (
         (typical_price * today_df["Volume"]).cumsum()
@@ -495,7 +640,7 @@ def prepare_candles(ticker, interval):
 
 
 # =====================================================
-# 8. تحليل السهم بشروط مخففة
+# 10. تحليل السهم
 # =====================================================
 
 def analyze_ticker(ticker):
@@ -511,99 +656,43 @@ def analyze_ticker(ticker):
 
     try:
 
-        df5, today5 = prepare_candles(
-            ticker,
-            "5m"
-        )
+        df5, today5 = prepare_candles(ticker, "5m")
+        df15, today15 = prepare_candles(ticker, "15m")
 
-        # فريم 15 دقيقة للتأكيد المساعد فقط
-        df15 = None
+        if len(df5) < 22 or len(df15) < 22:
 
-        try:
-
-            df15, today15 = prepare_candles(
-                ticker,
-                "15m"
-            )
-
-        except Exception as e:
-
-            logger.warning(
-                "%s: تعذر تجهيز فريم 15 دقيقة: %s",
-                ticker,
-                str(e)[:120]
-            )
-
-        if len(df5) < 22:
-
-            result["reason"] = (
-                "بيانات 5 دقائق غير كافية"
-            )
-
+            result["reason"] = "بيانات غير كافية"
             return result
 
         c5 = df5.iloc[-1]
+        c15 = df15.iloc[-1]
 
         close5 = safe_float(c5["Close"])
         ema5 = safe_float(c5["EMA20"])
         rsi5 = safe_float(c5["RSI"])
-        volume_ratio = safe_float(
-            c5["Volume_Ratio"]
-        )
+        volume_ratio = safe_float(c5["Volume_Ratio"])
 
-        vwap = safe_float(
-            today5.iloc[-1]["VWAP"]
-        )
+        close15 = safe_float(c15["Close"])
+        ema15 = safe_float(c15["EMA20"])
 
-        if df15 is not None and len(df15) >= 22:
-
-            c15 = df15.iloc[-1]
-
-            close15 = safe_float(c15["Close"])
-            ema15 = safe_float(c15["EMA20"])
-
-        else:
-
-            close15 = None
-            ema15 = None
+        vwap = safe_float(today5.iloc[-1]["VWAP"])
 
         values = [
-            close5,
-            ema5,
-            rsi5,
-            volume_ratio,
-            vwap
+            close5, ema5, rsi5, volume_ratio,
+            close15, ema15, vwap
         ]
 
         if any(value is None for value in values):
 
-            result["reason"] = (
-                "المؤشرات ناقصة أو غير صالحة"
-            )
-
+            result["reason"] = "المؤشرات ناقصة أو غير صالحة"
             return result
 
         if volume_ratio <= 0:
 
-            result["reason"] = (
-                "حجم التداول غير صالح"
-            )
-
+            result["reason"] = "حجم التداول غير صالح"
             return result
 
         result["underlying"] = close5
-
-        call_15m_support = (
-            close15 is not None
-            and ema15 is not None
-            and close15 > ema15
-        )
-
-        put_15m_support = (
-            close15 is not None
-            and ema15 is not None
-            and close15 < ema15
-        )
 
         details = (
             f"السعر={close5:.2f} | "
@@ -611,47 +700,35 @@ def analyze_ticker(ticker):
             f"EMA20={ema5:.2f} | "
             f"RSI={rsi5:.1f} | "
             f"Volume={volume_ratio:.2f}x | "
+            f"15m={close15:.2f}/{ema15:.2f}"
         )
-
-        if close15 is not None and ema15 is not None:
-
-            details += (
-                f"15m={close15:.2f}/{ema15:.2f}"
-            )
-
-        else:
-
-            details += "15m=غير متاح"
 
         result["details"] = details
 
-        # -------------------------------------------------
-        # الاتجاه الأساسي يعتمد على 5 دقائق
-        # 15 دقيقة تأكيد مساعد وليس شرطًا إلزاميًا
-        # -------------------------------------------------
+        call_score = sum([
+            close5 > vwap,
+            close5 > ema5,
+            close15 > ema15
+        ])
 
-        call_direction = (
-            close5 > vwap
-            or close5 > ema5
-        )
-
-        put_direction = (
-            close5 < vwap
-            or close5 < ema5
-        )
+        put_score = sum([
+            close5 < vwap,
+            close5 < ema5,
+            close15 < ema15
+        ])
 
         enough_volume = (
             volume_ratio >= MIN_VOLUME_RATIO
         )
 
         call_signal = (
-            call_direction
+            call_score >= MIN_DIRECTION_SCORE
             and enough_volume
             and CALL_RSI_MIN <= rsi5 <= CALL_RSI_MAX
         )
 
         put_signal = (
-            put_direction
+            put_score >= MIN_DIRECTION_SCORE
             and enough_volume
             and PUT_RSI_MIN <= rsi5 <= PUT_RSI_MAX
         )
@@ -660,16 +737,8 @@ def analyze_ticker(ticker):
 
             result["signal"] = "CALL"
             result["grade"] = "قوي"
-
-            confirmation = (
-                "15m يؤكد الاتجاه"
-                if call_15m_support
-                else "15m لا يؤكد الاتجاه، لكنه ليس شرطًا إلزاميًا"
-            )
-
             result["reason"] = (
-                "CALL: تحقق اتجاه 5 دقائق "
-                f"وحجم التداول وRSI. {confirmation}"
+                f"CALL: تحقق {call_score}/3 من شروط الاتجاه"
             )
 
             return result
@@ -678,16 +747,8 @@ def analyze_ticker(ticker):
 
             result["signal"] = "PUT"
             result["grade"] = "قوي"
-
-            confirmation = (
-                "15m يؤكد الاتجاه"
-                if put_15m_support
-                else "15m لا يؤكد الاتجاه، لكنه ليس شرطًا إلزاميًا"
-            )
-
             result["reason"] = (
-                "PUT: تحقق اتجاه 5 دقائق "
-                f"وحجم التداول وRSI. {confirmation}"
+                f"PUT: تحقق {put_score}/3 من شروط الاتجاه"
             )
 
             return result
@@ -695,7 +756,7 @@ def analyze_ticker(ticker):
         if call_signal and put_signal:
 
             result["reason"] = (
-                "الاتجاه غير واضح"
+                "الاتجاه غير واضح؛ تعارض شروط CALL وPUT"
             )
 
             return result
@@ -703,32 +764,34 @@ def analyze_ticker(ticker):
         failed_call = []
         failed_put = []
 
-        if not call_direction:
-            failed_call.append(
-                "السعر تحت VWAP وEMA20"
-            )
+        if close5 <= vwap:
+            failed_call.append("السعر تحت VWAP")
 
-        if not put_direction:
-            failed_put.append(
-                "السعر فوق VWAP وEMA20"
-            )
+        if close5 <= ema5:
+            failed_call.append("السعر تحت EMA20")
+
+        if close15 <= ema15:
+            failed_call.append("اتجاه 15 دقيقة ليس صاعدًا")
 
         if rsi5 < CALL_RSI_MIN or rsi5 > CALL_RSI_MAX:
-            failed_call.append(
-                "RSI خارج نطاق CALL"
-            )
+            failed_call.append("RSI خارج نطاق CALL")
+
+        if close5 >= vwap:
+            failed_put.append("السعر فوق VWAP")
+
+        if close5 >= ema5:
+            failed_put.append("السعر فوق EMA20")
+
+        if close15 >= ema15:
+            failed_put.append("اتجاه 15 دقيقة ليس هابطًا")
 
         if rsi5 < PUT_RSI_MIN or rsi5 > PUT_RSI_MAX:
-            failed_put.append(
-                "RSI خارج نطاق PUT"
-            )
+            failed_put.append("RSI خارج نطاق PUT")
 
         if not enough_volume:
-
             failed_call.append(
                 f"حجم التداول أقل من {MIN_VOLUME_RATIO}x"
             )
-
             failed_put.append(
                 f"حجم التداول أقل من {MIN_VOLUME_RATIO}x"
             )
@@ -751,41 +814,26 @@ def analyze_ticker(ticker):
 
 
 # =====================================================
-# 9. جلب عقد أوبشن 0DTE
+# 11. جلب عقد أوبشن 0DTE
 # =====================================================
 
-def get_0dte_contract(
-    ticker,
-    signal,
-    underlying_price
-):
+def get_0dte_contract(ticker, signal, underlying_price):
 
-    stock = yf.Ticker(ticker)
+    today_string = now_ny().date().isoformat()
 
-    today_string = (
-        now_ny().date().isoformat()
-    )
-
-    expirations = yahoo_call(
-        lambda: stock.options,
-        f"تواريخ انتهاء {ticker}"
-    )
-
-    if not expirations:
-
-        raise ValueError(
-            "Yahoo لم يرجع تواريخ انتهاء"
-        )
+    # استخدام الدالة الجديدة بدل stock.options المباشر
+    expirations = get_option_expirations(ticker)
 
     if today_string not in expirations:
 
         raise ValueError(
-            f"لا يوجد عقد ينتهي اليوم {today_string}"
+            f"لا يوجد عقد ينتهي اليوم {today_string}. "
+            f"التواريخ المتاحة: {', '.join(expirations[:5])}"
         )
 
-    chain = yahoo_call(
-        lambda: stock.option_chain(today_string),
-        f"سلسلة خيارات {ticker}"
+    chain = get_option_chain(
+        ticker,
+        today_string
     )
 
     options = (
@@ -795,10 +843,7 @@ def get_0dte_contract(
     )
 
     if options is None or options.empty:
-
-        raise ValueError(
-            "سلسلة العقود فارغة"
-        )
+        raise ValueError("سلسلة العقود فارغة")
 
     options = options.copy()
 
@@ -818,10 +863,7 @@ def get_0dte_contract(
     ]
 
     if missing:
-
-        raise ValueError(
-            f"بيانات العقد ناقصة: {missing}"
-        )
+        raise ValueError(f"بيانات العقد ناقصة: {missing}")
 
     for col in [
         "strike",
@@ -841,10 +883,7 @@ def get_0dte_contract(
     )
 
     if options.empty:
-
-        raise ValueError(
-            "لا توجد عقود ببيانات مكتملة"
-        )
+        raise ValueError("لا توجد عقود ببيانات مكتملة")
 
     options["lastTradeDate"] = pd.to_datetime(
         options["lastTradeDate"],
@@ -857,10 +896,7 @@ def get_0dte_contract(
     )
 
     if options.empty:
-
-        raise ValueError(
-            "لا توجد تواريخ تداول صالحة للعقود"
-        )
+        raise ValueError("لا توجد تواريخ تداول صالحة للعقود")
 
     now_utc = datetime.now(timezone.utc)
 
@@ -909,23 +945,12 @@ def get_0dte_contract(
     ].copy()
 
     if options.empty:
+        raise ValueError("فروق أسعار العقود مرتفعة")
 
-        raise ValueError(
-            "فروق أسعار العقود مرتفعة"
-        )
+    underlying_price = safe_float(underlying_price)
 
-    underlying_price = safe_float(
-        underlying_price
-    )
-
-    if (
-        underlying_price is None
-        or underlying_price <= 0
-    ):
-
-        raise ValueError(
-            "سعر السهم الأساسي غير صالح"
-        )
+    if underlying_price is None or underlying_price <= 0:
+        raise ValueError("سعر السهم الأساسي غير صالح")
 
     options["distance"] = (
         options["strike"] - underlying_price
@@ -947,30 +972,13 @@ def get_0dte_contract(
         value is None
         for value in [bid, ask, strike, spread]
     ):
-
-        raise ValueError(
-            "بيانات العقد المختار غير صالحة"
-        )
+        raise ValueError("بيانات العقد المختار غير صالحة")
 
     if bid <= 0 or ask <= 0 or ask < bid:
-
-        raise ValueError(
-            "سعر العقد غير صالح"
-        )
+        raise ValueError("سعر العقد غير صالح")
 
     if ask < MIN_OPTION_PRICE:
-
-        raise ValueError(
-            "سعر العقد أقل من الحد الأدنى"
-        )
-
-    entry = ask
-
-    if entry <= 0:
-
-        raise ValueError(
-            "سعر الدخول غير صالح"
-        )
+        raise ValueError("سعر العقد أقل من الحد الأدنى")
 
     return {
         "symbol": ticker,
@@ -980,7 +988,7 @@ def get_0dte_contract(
         "expiration": today_string,
         "bid": bid,
         "ask": ask,
-        "entry": entry,
+        "entry": ask,
         "spread": spread,
         "volume": int(contract["volume"]),
         "open_interest": int(contract["openInterest"]),
@@ -989,7 +997,7 @@ def get_0dte_contract(
 
 
 # =====================================================
-# 10. رسالة الفرصة
+# 12. رسالة الفرصة
 # =====================================================
 
 def trade_message(trade):
@@ -1015,28 +1023,23 @@ def trade_message(trade):
         f"🎯 الهدف 1: ${target1:.2f}\n"
         f"🎯 الهدف 2: ${target2:.2f}\n"
         f"🛑 الوقف: ${stop:.2f}\n\n"
-        f"المدة: حتى إغلاق السوق اليوم\n"
-        f"الانتهاء: {trade['expiration']} (0DTE)\n\n"
+        "المدة: حتى إغلاق السوق اليوم "
+        "(0DTE)\n\n"
         "⚠️ سعر الدخول تقديري حسب Ask، "
         "والتنبيه تحليلي وليس تنفيذًا للصفقة."
     )
 
 
 # =====================================================
-# 11. إرسال الرسائل للمشتركين
+# 13. إرسال الرسائل للمشتركين
 # =====================================================
 
-async def send_to_subscribers(
-    application,
-    message
-):
+async def send_to_subscribers(application, message):
 
     if not subscribers:
-
         logger.warning(
             "لا يوجد مشتركون؛ لم يتم تسليم التنبيه"
         )
-
         return False
 
     delivered = False
@@ -1065,7 +1068,7 @@ async def send_to_subscribers(
 
 
 # =====================================================
-# 12. فتح فرصة بعقد مؤكد
+# 14. فتح فرصة بعقد مؤكد
 # =====================================================
 
 async def open_trade(
@@ -1123,22 +1126,16 @@ async def open_trade(
 
 
 # =====================================================
-# 13. جلب سعر العقد للمتابعة
+# 15. جلب سعر العقد للمتابعة
 # =====================================================
 
-def get_contract_quote(
-    ticker,
-    expiration,
-    contract_symbol
-):
+def get_contract_quote(ticker, expiration, contract_symbol):
 
     try:
 
-        stock = yf.Ticker(ticker)
-
-        chain = yahoo_call(
-            lambda: stock.option_chain(expiration),
-            f"متابعة عقد {ticker}"
+        chain = get_option_chain(
+            ticker,
+            expiration
         )
 
         all_options = pd.concat(
@@ -1159,13 +1156,8 @@ def get_contract_quote(
 
         contract = match.iloc[0]
 
-        bid = safe_float(
-            contract.get("bid")
-        )
-
-        ask = safe_float(
-            contract.get("ask")
-        )
+        bid = safe_float(contract.get("bid"))
+        ask = safe_float(contract.get("ask"))
 
         if bid is None or ask is None:
             return None
@@ -1186,7 +1178,7 @@ def get_contract_quote(
 
 
 # =====================================================
-# 14. متابعة الأهداف والوقف
+# 16. متابعة الأهداف والوقف
 # =====================================================
 
 async def monitor_trades(application):
@@ -1203,11 +1195,7 @@ async def monitor_trades(application):
         if not trade:
             continue
 
-        # إغلاق المتابعة عند إغلاق السوق الأمريكي
-        if (
-            now.weekday() < 5
-            and now.time() >= MARKET_CLOSE
-        ):
+        if now.time() >= CLOSE_ALL_TIME:
 
             await send_to_subscribers(
                 application,
@@ -1236,7 +1224,6 @@ async def monitor_trades(application):
 
         change = (price - entry) / entry
 
-        # وقف الخسارة
         if (
             change <= STOP_LOSS
             and not trade["stop_sent"]
@@ -1257,7 +1244,6 @@ async def monitor_trades(application):
             active_trades.pop(ticker, None)
             continue
 
-        # الهدف الثاني
         if (
             change >= TAKE_PROFIT_2
             and not trade["tp2_sent"]
@@ -1274,7 +1260,6 @@ async def monitor_trades(application):
                 f"التغير: {change * 100:.1f}%"
             )
 
-        # الهدف الأول
         elif (
             change >= TAKE_PROFIT_1
             and not trade["tp1_sent"]
@@ -1293,13 +1278,10 @@ async def monitor_trades(application):
 
 
 # =====================================================
-# 15. محرك الفحص
+# 17. محرك الفحص
 # =====================================================
 
-async def run_scan(
-    application,
-    manual=False
-):
+async def run_scan(application, manual=False):
 
     global last_scan_time
     global last_scan_summary
@@ -1321,25 +1303,23 @@ async def run_scan(
         summary = {}
         errors = []
 
-        if not inside_saudi_schedule():
+        if not market_is_open_for_scanning():
 
-            return (
-                "خارج وقت تشغيل البوت.\n\n"
-                f"الوقت السعودي: "
-                f"{now_saudi().strftime('%H:%M:%S')}\n"
-                "وقت التشغيل: 17:00–00:00 بتوقيت السعودية."
-            )
+            if not (manual and market_is_open()):
 
-        if not market_is_open():
+                message = (
+                    "السوق خارج وقت الفحص.\n\n"
+                    f"وقت نيويورك: "
+                    f"{now_ny().strftime('%H:%M:%S')}\n"
+                    "الفحص التلقائي: 09:40–16:00\n"
+                    "الفحص اليدوي: 09:30–16:00\n"
+                    "لم يتم فتح فرص جديدة."
+                )
 
-            return (
-                "السوق الأمريكية مغلقة حاليًا.\n\n"
-                f"وقت نيويورك: "
-                f"{now_ny().strftime('%H:%M:%S')}\n"
-                f"الوقت السعودي: "
-                f"{now_saudi().strftime('%H:%M:%S')}\n"
-                "لن يتم فتح فرص جديدة خارج جلسة السوق."
-            )
+                last_scan_summary = {}
+                last_scan_errors = [message]
+
+                return message
 
         if daily_count >= MAX_PER_DAY:
 
@@ -1353,12 +1333,6 @@ async def run_scan(
             reset_daily_data_if_needed()
 
             if daily_count >= MAX_PER_DAY:
-                break
-
-            if not market_is_open():
-                break
-
-            if not inside_saudi_schedule():
                 break
 
             if ticker in sent_today:
@@ -1445,7 +1419,7 @@ async def run_scan(
 
             except Exception as e:
 
-                reason = str(e)[:200]
+                reason = str(e)[:350]
 
                 errors.append(
                     f"{ticker}: {reason}"
@@ -1468,9 +1442,7 @@ async def run_scan(
 
         report = (
             f"انتهى الفحص: "
-            f"{now_ny().strftime('%H:%M:%S')} نيويورك\n"
-            f"الوقت السعودي: "
-            f"{now_saudi().strftime('%H:%M:%S')}\n\n"
+            f"{now_ny().strftime('%H:%M:%S')} نيويورك\n\n"
             f"الفرص المرسلة بعقود مؤكدة: "
             f"{daily_count}/{MAX_PER_DAY}\n"
             f"الفرص المتوسطة المرصودة: "
@@ -1486,15 +1458,12 @@ async def run_scan(
 
 
 # =====================================================
-# 16. محرك الفحص التلقائي
+# 18. محرك الفحص التلقائي
 # =====================================================
 
 async def scanner_loop(application):
 
-    logger.info(
-        "بدأ محرك الفحص التلقائي: "
-        "17:00 إلى 00:00 بتوقيت السعودية"
-    )
+    logger.info("بدأ محرك الفحص التلقائي")
 
     while True:
 
@@ -1502,8 +1471,6 @@ async def scanner_loop(application):
 
             reset_daily_data_if_needed()
 
-            # الفحص خلال الوقت السعودي المحدد
-            # وبشرط أن تكون السوق الأمريكية مفتوحة
             if market_is_open_for_scanning():
 
                 await run_scan(
@@ -1511,7 +1478,6 @@ async def scanner_loop(application):
                     manual=False
                 )
 
-            # متابعة الصفقات النشطة
             await monitor_trades(application)
 
         except asyncio.CancelledError:
@@ -1527,7 +1493,7 @@ async def scanner_loop(application):
 
 
 # =====================================================
-# 17. أوامر تيليجرام
+# 19. أوامر تيليجرام
 # =====================================================
 
 async def start_command(update, context):
@@ -1539,15 +1505,8 @@ async def start_command(update, context):
     await update.message.reply_text(
         "✅ تم تفعيل اشتراكك في Aboghala Bot.\n\n"
         "البوت يبحث عن فرص CALL وPUT بعقود مؤكدة.\n"
-        "تم تخفيف شروط الدخول.\n"
         "لن يرسل فرصة إذا لم يستطع تحديد الاسترايك "
         "وسعر العقد.\n\n"
-        "رسالة الفرصة تحتوي على:\n"
-        "الشركة، الاتجاه، الاسترايك، السعر، "
-        "الهدف الأول والثاني، الوقف، والمدة.\n\n"
-        "⏰ وقت تشغيل البوت:\n"
-        "من 5:00 مساءً إلى 12:00 منتصف الليل "
-        "بتوقيت السعودية.\n\n"
         "الأوامر:\n"
         "/scan - فحص السوق\n"
         "/status - حالة البوت\n"
@@ -1587,39 +1546,31 @@ async def status_command(update, context):
     yahoo_text = (
         "يعمل"
         if yahoo_status["ok"]
-        else "تعذر الاتصال"
+        else "تعذر الاتصال أو جلب البيانات"
     )
-
-    saudi_time = now_saudi()
-    ny_time = now_ny()
 
     await update.message.reply_text(
         "📊 حالة Aboghala Bot\n\n"
-        "الحالة: يعمل\n\n"
-        f"الوقت السعودي: "
-        f"{saudi_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "الحالة: يعمل\n"
         f"وقت نيويورك: "
-        f"{ny_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"{now_ny().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"آخر محاولة فحص: {last_scan}\n"
         f"اختبار Yahoo: {yahoo_text}\n"
-        f"تفاصيل Yahoo: {yahoo_status['message'][:200]}\n\n"
+        f"تفاصيل Yahoo: {yahoo_status['message'][:300]}\n\n"
         f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}\n"
         f"الفرص المتوسطة المرصودة: {len(medium_seen_today)}\n"
         f"الصفقات النشطة: {len(active_trades)}\n"
         f"المشتركون: {len(subscribers)}\n"
         f"عدد الأسهم: {len(TICKERS)}\n\n"
-        "شروط الاتجاه: السعر فوق VWAP أو EMA20 للـCALL، "
-        "وتحتهما للـPUT.\n"
+        "شروط الاتجاه: 2 من 3\n"
         f"حجم التداول الأدنى: {MIN_VOLUME_RATIO}x\n"
         f"RSI CALL: {CALL_RSI_MIN}–{CALL_RSI_MAX}\n"
-        f"RSI PUT: {PUT_RSI_MIN}–{PUT_RSI_MAX}\n"
-        "فريم 15 دقيقة: تأكيد مساعد فقط.\n\n"
-        "وقت تشغيل البوت: 17:00–00:00 السعودية.\n"
-        f"البوت داخل فترة التشغيل: "
-        f"{'نعم' if inside_saudi_schedule() else 'لا'}\n"
-        f"السوق الأمريكية مفتوحة: "
-        f"{'نعم' if market_is_open() else 'لا'}\n"
-        "نهاية متابعة العقود: إغلاق السوق الأمريكية."
+        f"RSI PUT: {PUT_RSI_MIN}–{PUT_RSI_MAX}\n\n"
+        f"الفحص التلقائي: "
+        f"{'نعم' if market_is_open_for_scanning() else 'لا'}\n"
+        "وقت الفحص التلقائي: 09:40–16:00 نيويورك\n"
+        "الفحص اليدوي: 09:30–16:00 نيويورك\n"
+        "نهاية متابعة العقود: 16:00 نيويورك"
     )
 
 
@@ -1635,26 +1586,18 @@ async def report_command(update, context):
 
     lines = [
         "📋 تقرير آخر فحص",
-        f"الوقت بنيويورك: "
-        f"{last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"الوقت السعودي: "
-        f"{now_saudi().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"الوقت: {last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"الفرص المرسلة: {daily_count}/{MAX_PER_DAY}",
         f"الفرص المتوسطة: {len(medium_seen_today)}",
         ""
     ]
 
     for ticker, result in last_scan_summary.items():
-        lines.append(
-            f"{ticker}: {result}"
-        )
+        lines.append(f"{ticker}: {result}")
 
     if last_scan_errors:
 
-        lines.append(
-            "\nأخطاء جلب العقود:"
-        )
-
+        lines.append("\nأخطاء جلب العقود:")
         lines.extend(last_scan_errors)
 
     await reply_long(
@@ -1676,21 +1619,17 @@ async def debug_command(update, context):
 
     lines = [
         "🔬 تشخيص الأسهم\n",
-        "شروط الدخول مخففة.",
-        f"حجم التداول الأدنى: {MIN_VOLUME_RATIO}x",
+        "شروط الدخول مخففة: تحقق شرطين من ثلاثة للاتجاه.",
+        f"الحد الأدنى للحجم: {MIN_VOLUME_RATIO}x",
         f"RSI CALL: {CALL_RSI_MIN}–{CALL_RSI_MAX}",
         f"RSI PUT: {PUT_RSI_MIN}–{PUT_RSI_MAX}",
-        "الاتجاه يعتمد على فريم 5 دقائق.",
-        "فريم 15 دقيقة تأكيد مساعد وليس شرطًا إلزاميًا.",
+        "فريم 15 دقيقة تأكيد مساعد.",
         "لا يتم إرسال فرصة إلا بعد تأكيد عقد الأوبشن.",
-        "وقت التشغيل: 17:00–00:00 السعودية."
+        f"اختبار Yahoo: {yahoo_status['message']}"
     ]
 
     for ticker, reason in last_scan_summary.items():
-
-        lines.append(
-            f"\n{ticker}: {reason}"
-        )
+        lines.append(f"\n{ticker}: {reason}")
 
     await reply_long(
         update,
@@ -1708,9 +1647,7 @@ async def active_command(update, context):
 
         return
 
-    lines = [
-        "📌 الصفقات النشطة"
-    ]
+    lines = ["📌 الصفقات النشطة"]
 
     for ticker, trade in active_trades.items():
 
@@ -1741,35 +1678,29 @@ async def help_command(update, context):
         "/report - تقرير آخر فحص\n"
         "/debug - تشخيص الأسهم\n"
         "/active - الصفقات النشطة\n"
-        "/help - المساعدة\n\n"
-        "وقت التشغيل: 5 مساءً إلى 12 صباحًا "
-        "بتوقيت السعودية."
+        "/help - المساعدة"
     )
 
 
 # =====================================================
-# 18. بدء المهام
+# 20. بدء المهام
 # =====================================================
 
 async def post_init(application):
 
-    asyncio.create_task(
-        asyncio.to_thread(
-            test_yahoo_connection
-        )
+    application.create_task(
+        asyncio.to_thread(test_yahoo_connection)
     )
 
     application.create_task(
         scanner_loop(application)
     )
 
-    logger.info(
-        "تم بدء مهام Aboghala Bot"
-    )
+    logger.info("تم بدء مهام Aboghala Bot")
 
 
 # =====================================================
-# 19. خادم Render
+# 21. خادم Render
 # =====================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -1807,9 +1738,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
 
-    port = int(
-        os.getenv("PORT", "10000")
-    )
+    port = int(os.getenv("PORT", "10000"))
 
     server = HTTPServer(
         ("0.0.0.0", port),
@@ -1825,7 +1754,7 @@ def start_health_server():
 
 
 # =====================================================
-# 20. تشغيل البوت
+# 22. تشغيل البوت
 # =====================================================
 
 def main():
@@ -1877,9 +1806,7 @@ def main():
         CommandHandler("help", help_command)
     )
 
-    logger.info(
-        "Aboghala Bot is starting..."
-    )
+    logger.info("Aboghala Bot is starting...")
 
     application.run_polling(
         drop_pending_updates=True,
