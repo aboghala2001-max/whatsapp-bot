@@ -13,7 +13,7 @@ import pandas as pd
 import yfinance as yf
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
 
 # =====================================================
@@ -38,23 +38,30 @@ MAX_PER_DAY = 10
 SCAN_INTERVAL = 60
 
 START_SCAN = time(9, 40)
-
-# يستمر البحث حتى نهاية جلسة السوق
 STOP_NEW_TRADES = time(16, 0)
-
-# تنتهي متابعة العقود عند إغلاق السوق
 CLOSE_ALL_TIME = time(16, 0)
 
+# شروط العقد
 MIN_OPTION_PRICE = 0.10
 MIN_OPEN_INTEREST = 100
 MIN_OPTION_VOLUME = 10
 MAX_SPREAD_PERCENT = 20
+MAX_OPTION_TRADE_AGE_MINUTES = 20
 
+# شروط الاستراتيجية المخففة
+MIN_VOLUME_RATIO = 0.8
+MIN_DIRECTION_SCORE = 2
+
+CALL_RSI_MIN = 45
+CALL_RSI_MAX = 75
+
+PUT_RSI_MIN = 25
+PUT_RSI_MAX = 55
+
+# الأهداف والوقف
 TAKE_PROFIT_1 = 0.30
 TAKE_PROFIT_2 = 0.60
 STOP_LOSS = -0.35
-
-MAX_OPTION_TRADE_AGE_MINUTES = 20
 
 MAX_5M_CANDLE_AGE_MINUTES = 15
 MAX_15M_CANDLE_AGE_MINUTES = 25
@@ -75,20 +82,13 @@ logging.basicConfig(
 logger = logging.getLogger("AboghalaBot")
 
 subscribers = set()
-
 active_trades = {}
 
-# الأسهم التي أرسل البوت عنها تنبيهًا اليوم
-# سواء كان التنبيه بعقد مؤكد أو دون عقد
 sent_today = set()
-
 strong_seen_today = set()
 medium_seen_today = set()
 
-# عدد التنبيهات القوية المرسلة اليوم
-# يشمل الإشارات التي لم يتوفر لها عقد مؤكد
 daily_count = 0
-
 current_day = None
 
 last_scan_time = None
@@ -160,6 +160,7 @@ def market_is_open():
 def safe_float(value):
 
     try:
+
         result = float(value)
 
         if not math.isfinite(result):
@@ -238,7 +239,7 @@ def yahoo_call(function, description="Yahoo"):
 
 
 # =====================================================
-# 5. اختبار اتصال Yahoo
+# 5. اختبار Yahoo
 # =====================================================
 
 def test_yahoo_connection():
@@ -262,12 +263,11 @@ def test_yahoo_connection():
         yahoo_status = {
             "ok": True,
             "message": (
-                f"الاتصال يعمل، تواريخ الانتهاء المتاحة: "
+                f"الاتصال يعمل، تواريخ الانتهاء: "
                 f"{len(expirations)}"
             )
         }
 
-        logger.info("اختبار Yahoo ناجح")
         return True
 
     except Exception as e:
@@ -277,10 +277,7 @@ def test_yahoo_connection():
             "message": str(e)[:250]
         }
 
-        logger.error(
-            "فشل اختبار Yahoo: %s",
-            str(e)[:250]
-        )
+        logger.error("فشل اختبار Yahoo: %s", str(e)[:250])
 
         return False
 
@@ -314,7 +311,7 @@ def calculate_rsi(series, period=14):
 
 
 # =====================================================
-# 7. جلب الشموع وتجهيز المؤشرات
+# 7. تجهيز الشموع والمؤشرات
 # =====================================================
 
 def prepare_candles(ticker, interval):
@@ -332,7 +329,7 @@ def prepare_candles(ticker, interval):
     )
 
     if df is None or df.empty:
-        raise ValueError("لم تصل بيانات الشموع من Yahoo")
+        raise ValueError("لم تصل بيانات الشموع")
 
     df = df.copy()
 
@@ -346,7 +343,7 @@ def prepare_candles(ticker, interval):
     ]
 
     if missing:
-        raise ValueError(f"أعمدة الشموع ناقصة: {missing}")
+        raise ValueError(f"أعمدة ناقصة: {missing}")
 
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("تنسيق وقت الشموع غير صالح")
@@ -358,7 +355,6 @@ def prepare_candles(ticker, interval):
 
     df = df.sort_index()
     df = df[required].copy()
-
     df = df.dropna(subset=required)
 
     df = df[
@@ -377,7 +373,6 @@ def prepare_candles(ticker, interval):
         df.index + timedelta(minutes=minutes)
     )
 
-    # الاحتفاظ بالشموع المكتملة فقط
     df = df.loc[
         candle_close_times <= now - timedelta(seconds=30)
     ]
@@ -400,6 +395,7 @@ def prepare_candles(ticker, interval):
     )
 
     if age_minutes > max_age:
+
         raise ValueError(
             f"بيانات {interval} قديمة "
             f"({age_minutes:.1f} دقيقة)"
@@ -422,7 +418,6 @@ def prepare_candles(ticker, interval):
         / df["Volume_Avg"].replace(0, float("nan"))
     )
 
-    # VWAP لليوم الحالي
     today = now.date()
 
     today_df = df[
@@ -441,9 +436,7 @@ def prepare_candles(ticker, interval):
     cumulative_volume = today_df["Volume"].cumsum()
 
     if cumulative_volume.iloc[-1] <= 0:
-        raise ValueError(
-            "حجم التداول غير صالح لحساب VWAP"
-        )
+        raise ValueError("حجم التداول غير صالح لحساب VWAP")
 
     today_df["VWAP"] = (
         (typical_price * today_df["Volume"]).cumsum()
@@ -454,7 +447,7 @@ def prepare_candles(ticker, interval):
 
 
 # =====================================================
-# 8. تحليل السهم وتصنيف الفرص
+# 8. تحليل السهم بشروط مخففة
 # =====================================================
 
 def analyze_ticker(ticker):
@@ -475,19 +468,13 @@ def analyze_ticker(ticker):
 
         if len(df5) < 22 or len(df15) < 22:
 
-            result["reason"] = (
-                f"بيانات غير كافية: "
-                f"5m={len(df5)} | 15m={len(df15)}"
-            )
-
+            result["reason"] = "بيانات غير كافية"
             return result
 
         c5 = df5.iloc[-1]
-        previous_c5 = df5.iloc[-2]
         c15 = df15.iloc[-1]
 
         close5 = safe_float(c5["Close"])
-        previous_close5 = safe_float(previous_c5["Close"])
         ema5 = safe_float(c5["EMA20"])
         rsi5 = safe_float(c5["RSI"])
         volume_ratio = safe_float(c5["Volume_Ratio"])
@@ -498,22 +485,13 @@ def analyze_ticker(ticker):
         vwap = safe_float(today5.iloc[-1]["VWAP"])
 
         values = [
-            close5,
-            previous_close5,
-            ema5,
-            rsi5,
-            volume_ratio,
-            close15,
-            ema15,
-            vwap
+            close5, ema5, rsi5, volume_ratio,
+            close15, ema15, vwap
         ]
 
         if any(value is None for value in values):
 
-            result["reason"] = (
-                "المؤشرات ناقصة أو غير صالحة"
-            )
-
+            result["reason"] = "المؤشرات ناقصة أو غير صالحة"
             return result
 
         if volume_ratio <= 0:
@@ -534,145 +512,100 @@ def analyze_ticker(ticker):
 
         result["details"] = details
 
-        # شروط الاتجاه الأساسية الأصلية
-        call_core = (
-            close5 > vwap
-            and close5 > ema5
-            and close15 > ema15
-            and volume_ratio >= 1.2
+        # -------------------------------------------------
+        # تخفيف شروط الاتجاه:
+        # نحتاج تحقق شرطين من ثلاثة بدل الشروط الثلاثة
+        # -------------------------------------------------
+
+        call_score = sum([
+            close5 > vwap,
+            close5 > ema5,
+            close15 > ema15
+        ])
+
+        put_score = sum([
+            close5 < vwap,
+            close5 < ema5,
+            close15 < ema15
+        ])
+
+        enough_volume = (
+            volume_ratio >= MIN_VOLUME_RATIO
         )
 
-        put_core = (
-            close5 < vwap
-            and close5 < ema5
-            and close15 < ema15
-            and volume_ratio >= 1.2
+        call_signal = (
+            call_score >= MIN_DIRECTION_SCORE
+            and enough_volume
+            and CALL_RSI_MIN <= rsi5 <= CALL_RSI_MAX
         )
 
-        # شروط CALL الأصلية
-        call_original = (
-            call_core
-            and 52 <= rsi5 <= 72
+        put_signal = (
+            put_score >= MIN_DIRECTION_SCORE
+            and enough_volume
+            and PUT_RSI_MIN <= rsi5 <= PUT_RSI_MAX
         )
 
-        # CALL استمرار الصعود
-        call_continuation = (
-            call_core
-            and rsi5 > 72
-            and close5 > previous_close5
-        )
-
-        # شروط PUT الأصلية
-        put_original = (
-            put_core
-            and 28 <= rsi5 <= 48
-        )
-
-        # PUT استمرار الهبوط
-        put_continuation = (
-            put_core
-            and rsi5 < 28
-            and close5 < previous_close5
-        )
-
-        # الفرص القوية
-        if call_original:
+        if call_signal and not put_signal:
 
             result["signal"] = "CALL"
             result["grade"] = "قوي"
             result["reason"] = (
-                "🟢 CALL قوي: اكتملت الشروط الأصلية"
+                f"CALL: تحقق {call_score}/3 من شروط الاتجاه"
             )
 
             return result
 
-        if call_continuation:
-
-            result["signal"] = "CALL"
-            result["grade"] = "قوي"
-            result["reason"] = (
-                "🟢 CALL قوي: استمرار الصعود "
-                "مع تأكيد إغلاق الشمعة"
-            )
-
-            return result
-
-        if put_original:
+        if put_signal and not call_signal:
 
             result["signal"] = "PUT"
             result["grade"] = "قوي"
             result["reason"] = (
-                "🟢 PUT قوي: اكتملت الشروط الأصلية"
+                f"PUT: تحقق {put_score}/3 من شروط الاتجاه"
             )
 
             return result
 
-        if put_continuation:
+        if call_signal and put_signal:
 
-            result["signal"] = "PUT"
-            result["grade"] = "قوي"
             result["reason"] = (
-                "🟢 PUT قوي: استمرار الهبوط "
-                "مع تأكيد إغلاق الشمعة"
+                "الاتجاه غير واضح؛ تعارض شروط CALL وPUT"
             )
 
             return result
 
-        # الفرص المتوسطة
-        if call_core:
-
-            result["signal"] = "CALL"
-            result["grade"] = "متوسط"
-            result["reason"] = (
-                "🟡 CALL متوسط: الاتجاه والحجم متوافقان "
-                "لكن شرط RSI أو تأكيد الاستمرار غير مكتمل.\n"
-                + details
-            )
-
-            return result
-
-        if put_core:
-
-            result["signal"] = "PUT"
-            result["grade"] = "متوسط"
-            result["reason"] = (
-                "🟡 PUT متوسط: الاتجاه والحجم متوافقان "
-                "لكن شرط RSI أو تأكيد الاستمرار غير مكتمل.\n"
-                + details
-            )
-
-            return result
-
-        # لا دخول
+        # تشخيص أسباب عدم الدخول
         failed_call = []
         failed_put = []
 
         if close5 <= vwap:
-            failed_call.append("السعر ليس فوق VWAP")
+            failed_call.append("السعر تحت VWAP")
 
         if close5 <= ema5:
-            failed_call.append("السعر ليس فوق EMA20")
+            failed_call.append("السعر تحت EMA20")
 
         if close15 <= ema15:
             failed_call.append("اتجاه 15 دقيقة ليس صاعدًا")
 
-        if volume_ratio < 1.2:
-            failed_call.append("حجم التداول أقل من 1.2x")
+        if rsi5 < CALL_RSI_MIN or rsi5 > CALL_RSI_MAX:
+            failed_call.append("RSI خارج نطاق CALL")
 
         if close5 >= vwap:
-            failed_put.append("السعر ليس تحت VWAP")
+            failed_put.append("السعر فوق VWAP")
 
         if close5 >= ema5:
-            failed_put.append("السعر ليس تحت EMA20")
+            failed_put.append("السعر فوق EMA20")
 
         if close15 >= ema15:
             failed_put.append("اتجاه 15 دقيقة ليس هابطًا")
 
-        if volume_ratio < 1.2:
-            failed_put.append("حجم التداول أقل من 1.2x")
+        if rsi5 < PUT_RSI_MIN or rsi5 > PUT_RSI_MAX:
+            failed_put.append("RSI خارج نطاق PUT")
+
+        if not enough_volume:
+            failed_call.append("حجم التداول أقل من 0.8x")
+            failed_put.append("حجم التداول أقل من 0.8x")
 
         result["reason"] = (
-            "🔴 لا دخول\n"
             "CALL: " + ", ".join(failed_call)
             + "\nPUT: " + ", ".join(failed_put)
             + "\n" + details
@@ -690,7 +623,7 @@ def analyze_ticker(ticker):
 
 
 # =====================================================
-# 9. جلب عقود 0DTE
+# 9. جلب عقد أوبشن 0DTE
 # =====================================================
 
 def get_0dte_contract(ticker, signal, underlying_price):
@@ -710,8 +643,7 @@ def get_0dte_contract(ticker, signal, underlying_price):
     if today_string not in expirations:
 
         raise ValueError(
-            f"لا يوجد عقد ينتهي اليوم {today_string}. "
-            f"التواريخ المتاحة: {', '.join(expirations[:5])}"
+            f"لا يوجد عقد ينتهي اليوم {today_string}"
         )
 
     chain = yahoo_call(
@@ -779,7 +711,7 @@ def get_0dte_contract(ticker, signal, underlying_price):
     )
 
     if options.empty:
-        raise ValueError("لا توجد عقود بتاريخ تداول صالح")
+        raise ValueError("لا توجد تواريخ تداول صالحة للعقود")
 
     now_utc = datetime.now(timezone.utc)
 
@@ -795,8 +727,8 @@ def get_0dte_contract(ticker, signal, underlying_price):
     if options.empty:
 
         raise ValueError(
-            "آخر تداول للعقود قديم أو غير حديث "
-            f"(أكثر من {MAX_OPTION_TRADE_AGE_MINUTES} دقيقة)"
+            "آخر تداول للعقود أقدم من "
+            f"{MAX_OPTION_TRADE_AGE_MINUTES} دقيقة"
         )
 
     options = options[
@@ -811,8 +743,7 @@ def get_0dte_contract(ticker, signal, underlying_price):
     if options.empty:
 
         raise ValueError(
-            "لا توجد عقود تحقق شروط السيولة والسعر "
-            "والحجم المفتوح"
+            "لا توجد عقود تحقق شروط السعر والسيولة"
         )
 
     midpoint = (
@@ -829,9 +760,7 @@ def get_0dte_contract(ticker, signal, underlying_price):
     ].copy()
 
     if options.empty:
-        raise ValueError(
-            "العقود المتاحة فروق أسعارها أعلى من 20%"
-        )
+        raise ValueError("فروق أسعار العقود مرتفعة")
 
     underlying_price = safe_float(underlying_price)
 
@@ -861,10 +790,12 @@ def get_0dte_contract(ticker, signal, underlying_price):
         raise ValueError("بيانات العقد المختار غير صالحة")
 
     if bid <= 0 or ask <= 0 or ask < bid:
-        raise ValueError("سعر Bid أو Ask غير صالح")
+        raise ValueError("سعر العقد غير صالح")
 
     if ask < MIN_OPTION_PRICE:
         raise ValueError("سعر العقد أقل من الحد الأدنى")
+
+    entry = ask
 
     return {
         "symbol": ticker,
@@ -874,17 +805,148 @@ def get_0dte_contract(ticker, signal, underlying_price):
         "expiration": today_string,
         "bid": bid,
         "ask": ask,
-        "entry": ask,
+        "entry": entry,
         "spread": spread,
         "volume": int(contract["volume"]),
         "open_interest": int(contract["openInterest"]),
-        "underlying": underlying_price,
-        "last_trade": str(contract["lastTradeDate"])
+        "underlying": underlying_price
     }
 
 
 # =====================================================
-# 10. متابعة أسعار العقود
+# 10. رسالة الفرصة المختصرة
+# =====================================================
+
+def trade_message(trade):
+
+    entry = trade["entry"]
+
+    target1 = entry * (1 + TAKE_PROFIT_1)
+    target2 = entry * (1 + TAKE_PROFIT_2)
+    stop = entry * (1 + STOP_LOSS)
+
+    direction = (
+        "CALL 🟢"
+        if trade["type"] == "CALL"
+        else "PUT 🔴"
+    )
+
+    return (
+        "🚨 فرصة أوبشن\n\n"
+        f"الشركة: {trade['symbol']}\n"
+        f"الاتجاه: {direction}\n"
+        f"الاسترايك: ${trade['strike']:.2f}\n"
+        f"السعر: ${entry:.2f}\n\n"
+        f"🎯 الهدف 1: ${target1:.2f}\n"
+        f"🎯 الهدف 2: ${target2:.2f}\n"
+        f"🛑 الوقف: ${stop:.2f}\n\n"
+        "المدة: حتى إغلاق السوق اليوم "
+        "(0DTE)\n\n"
+        "⚠️ سعر الدخول تقديري حسب Ask، "
+        "والتنبيه تحليلي وليس تنفيذًا للصفقة."
+    )
+
+
+# =====================================================
+# 11. إرسال الرسائل للمشتركين
+# =====================================================
+
+async def send_to_subscribers(application, message):
+
+    if not subscribers:
+        logger.warning("لا يوجد مشتركون؛ لم يتم تسليم التنبيه")
+        return False
+
+    delivered = False
+
+    for chat_id in list(subscribers):
+
+        try:
+
+            success_for_chat = True
+
+            for chunk in split_message(message):
+
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk
+                )
+
+            if success_for_chat:
+                delivered = True
+
+        except Exception:
+
+            logger.exception(
+                "تعذر إرسال رسالة للمشترك %s",
+                chat_id
+            )
+
+    return delivered
+
+
+# =====================================================
+# 12. فتح فرصة بعقد مؤكد
+# =====================================================
+
+async def open_trade(
+    application,
+    ticker,
+    signal,
+    contract
+):
+
+    global daily_count
+
+    reset_daily_data_if_needed()
+
+    if daily_count >= MAX_PER_DAY:
+        return False
+
+    if ticker in sent_today:
+        return False
+
+    if ticker in active_trades:
+        return False
+
+    trade = {
+        **contract,
+        "grade": "قوي",
+        "opened_at": now_ny(),
+        "tp1_sent": False,
+        "tp2_sent": False,
+        "stop_sent": False
+    }
+
+    # إرسال الفرصة أولًا
+    delivered = await send_to_subscribers(
+        application,
+        trade_message(trade)
+    )
+
+    # لا نحتسبها مرسلة إذا لم تصل لأحد
+    if not delivered:
+        return False
+
+    active_trades[ticker] = trade
+
+    sent_today.add(ticker)
+    strong_seen_today.add(ticker)
+
+    daily_count += 1
+
+    logger.info(
+        "تم تسليم فرصة %s %s بعقد %s",
+        ticker,
+        signal,
+        contract["contract"]
+    )
+
+    return True
+
+
+# =====================================================
+# 13. جلب سعر العقد للمتابعة
 # =====================================================
 
 def get_contract_quote(ticker, expiration, contract_symbol):
@@ -925,12 +987,7 @@ def get_contract_quote(ticker, expiration, contract_symbol):
         if bid <= 0 or ask <= 0 or ask < bid:
             return None
 
-        midpoint = (bid + ask) / 2
-
-        if midpoint <= 0:
-            return None
-
-        return midpoint
+        return (bid + ask) / 2
 
     except Exception:
 
@@ -943,191 +1000,7 @@ def get_contract_quote(ticker, expiration, contract_symbol):
 
 
 # =====================================================
-# 11. رسائل الفرص
-# =====================================================
-
-def trade_message(trade):
-
-    return (
-        "🚨 فرصة أوبشن جديدة\n\n"
-        f"السهم: {trade['symbol']}\n"
-        f"النوع: {trade['type']}\n"
-        f"قوة الفرصة: {trade.get('grade', 'قوي')} 🟢\n\n"
-        f"العقد: {trade['contract']}\n"
-        f"Strike: {trade['strike']:.2f}\n"
-        f"الانتهاء: {trade['expiration']} (0DTE)\n\n"
-        f"سعر الدخول التقديري: ${trade['entry']:.2f}\n"
-        f"Bid: ${trade['bid']:.2f}\n"
-        f"Ask: ${trade['ask']:.2f}\n"
-        f"فرق السعر: {trade['spread']:.1f}%\n"
-        f"حجم العقد: {trade['volume']}\n"
-        f"Open Interest: {trade['open_interest']}\n\n"
-        f"سعر السهم الأساسي: ${trade['underlying']:.2f}\n\n"
-        "🎯 الهدف الأول: +30%\n"
-        "🎯 الهدف الثاني: +60%\n"
-        "🛑 وقف الخسارة: -35%\n\n"
-        "⚠️ سعر الدخول تقديري وفق Ask، "
-        "وسعر المتابعة وفق منتصف Bid وAsk.\n"
-        "⚠️ التنبيه تحليلي فقط وليس تنفيذًا لصفقة."
-    )
-
-
-def signal_without_contract_message(
-    ticker,
-    signal,
-    analysis,
-    error
-):
-
-    return (
-        "⚠️ إشارة قوية - العقد غير مؤكد\n\n"
-        f"السهم: {ticker}\n"
-        f"الاتجاه: {signal}\n"
-        "قوة الإشارة: قوية 🟢\n\n"
-        f"سعر السهم عند اكتشاف الإشارة: "
-        f"${analysis['underlying']:.2f}\n\n"
-        f"تفاصيل المؤشرات:\n{analysis['details']}\n\n"
-        "⚠️ تعذر تأكيد عقد الأوبشن من Yahoo.\n"
-        f"السبب: {str(error)[:250]}\n\n"
-        "لم يتم تحديد عقد أو سعر دخول أو أهداف؛ "
-        "لذلك لا تعتبر هذه رسالة دخول على عقد.\n\n"
-        f"وقت اكتشاف الإشارة: "
-        f"{now_ny().strftime('%H:%M:%S')} نيويورك."
-    )
-
-
-# =====================================================
-# 12. إرسال الرسائل للمشتركين
-# =====================================================
-
-async def send_to_subscribers(application, message):
-
-    for chat_id in list(subscribers):
-
-        try:
-
-            for chunk in split_message(message):
-
-                await application.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk
-                )
-
-        except Exception:
-
-            logger.exception(
-                "تعذر إرسال رسالة للمشترك %s",
-                chat_id
-            )
-
-
-# =====================================================
-# 13. إرسال إشارة قوية دون عقد مؤكد
-# =====================================================
-
-async def send_signal_without_contract(
-    application,
-    ticker,
-    signal,
-    analysis,
-    error
-):
-
-    global daily_count
-
-    reset_daily_data_if_needed()
-
-    if ticker in sent_today:
-        return False
-
-    if daily_count >= MAX_PER_DAY:
-        return False
-
-    # منع تكرار إرسال السهم في اليوم نفسه
-    sent_today.add(ticker)
-    strong_seen_today.add(ticker)
-
-    # تحتسب ضمن حد التنبيهات اليومية
-    daily_count += 1
-
-    message = signal_without_contract_message(
-        ticker,
-        signal,
-        analysis,
-        error
-    )
-
-    await send_to_subscribers(
-        application,
-        message
-    )
-
-    logger.warning(
-        "تم إرسال إشارة %s %s دون عقد مؤكد",
-        ticker,
-        signal
-    )
-
-    return True
-
-
-# =====================================================
-# 14. فتح فرصة بعقد مؤكد
-# =====================================================
-
-async def open_trade(
-    application,
-    ticker,
-    signal,
-    contract
-):
-
-    global daily_count
-
-    reset_daily_data_if_needed()
-
-    if daily_count >= MAX_PER_DAY:
-        return False
-
-    if ticker in sent_today:
-        return False
-
-    if ticker in active_trades:
-        return False
-
-    trade = {
-        **contract,
-        "grade": "قوي",
-        "opened_at": now_ny().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-        "tp1_sent": False,
-        "tp2_sent": False
-    }
-
-    active_trades[ticker] = trade
-
-    sent_today.add(ticker)
-    strong_seen_today.add(ticker)
-
-    daily_count += 1
-
-    await send_to_subscribers(
-        application,
-        trade_message(trade)
-    )
-
-    logger.info(
-        "تم إرسال فرصة %s %s",
-        ticker,
-        signal
-    )
-
-    return True
-
-
-# =====================================================
-# 15. متابعة الأهداف ووقف الخسارة
+# 14. متابعة الأهداف والوقف
 # =====================================================
 
 async def monitor_trades(application):
@@ -1144,14 +1017,13 @@ async def monitor_trades(application):
         if not trade:
             continue
 
-        # إيقاف متابعة العقود عند إغلاق السوق
         if now.time() >= CLOSE_ALL_TIME:
 
             await send_to_subscribers(
                 application,
-                f"⏰ انتهت متابعة {ticker}\n"
+                f"⏰ انتهت مدة عقد {ticker}\n"
                 f"العقد: {trade['contract']}\n"
-                "يرجى التحقق من العقد يدويًا."
+                "انتهت متابعة البوت عند إغلاق السوق."
             )
 
             active_trades.pop(ticker, None)
@@ -1175,15 +1047,20 @@ async def monitor_trades(application):
         change = (price - entry) / entry
 
         # وقف الخسارة
-        if change <= STOP_LOSS:
+        if (
+            change <= STOP_LOSS
+            and not trade["stop_sent"]
+        ):
+
+            trade["stop_sent"] = True
 
             await send_to_subscribers(
                 application,
-                "🛑 تنبيه وقف الخسارة\n\n"
-                f"{ticker} | {trade['type']}\n"
+                "🛑 وقف الخسارة\n\n"
+                f"الشركة: {ticker}\n"
                 f"العقد: {trade['contract']}\n"
-                f"سعر الدخول: ${entry:.2f}\n"
-                f"السعر الحالي التقريبي: ${price:.2f}\n"
+                f"الدخول: ${entry:.2f}\n"
+                f"السعر الحالي: ${price:.2f}\n"
                 f"التغير: {change * 100:.1f}%"
             )
 
@@ -1201,11 +1078,10 @@ async def monitor_trades(application):
             await send_to_subscribers(
                 application,
                 "🎯 تحقق الهدف الثاني\n\n"
-                f"{ticker} | {trade['type']}\n"
+                f"الشركة: {ticker}\n"
                 f"العقد: {trade['contract']}\n"
-                f"سعر الدخول: ${entry:.2f}\n"
-                f"السعر الحالي التقريبي: ${price:.2f}\n"
-                f"الربح التقريبي: {change * 100:.1f}%"
+                f"السعر الحالي: ${price:.2f}\n"
+                f"التغير: {change * 100:.1f}%"
             )
 
         # الهدف الأول
@@ -1219,16 +1095,15 @@ async def monitor_trades(application):
             await send_to_subscribers(
                 application,
                 "✅ تحقق الهدف الأول\n\n"
-                f"{ticker} | {trade['type']}\n"
+                f"الشركة: {ticker}\n"
                 f"العقد: {trade['contract']}\n"
-                f"سعر الدخول: ${entry:.2f}\n"
-                f"السعر الحالي التقريبي: ${price:.2f}\n"
-                f"الربح التقريبي: {change * 100:.1f}%"
+                f"السعر الحالي: ${price:.2f}\n"
+                f"التغير: {change * 100:.1f}%"
             )
 
 
 # =====================================================
-# 16. محرك الفحص
+# 15. محرك الفحص
 # =====================================================
 
 async def run_scan(application, manual=False):
@@ -1253,20 +1128,16 @@ async def run_scan(application, manual=False):
         summary = {}
         errors = []
 
-        # الفحص التلقائي يبدأ 09:40
-        # الفحص اليدوي مسموح خلال جلسة السوق كاملة
         if not market_is_open_for_scanning():
 
             if not (manual and market_is_open()):
 
                 message = (
-                    "السوق خارج وقت البحث المحدد.\n\n"
-                    f"وقت نيويورك الآن: "
+                    "السوق خارج وقت الفحص.\n\n"
+                    f"وقت نيويورك: "
                     f"{now_ny().strftime('%H:%M:%S')}\n"
-                    "وقت الفحص التلقائي: 09:40 إلى 16:00 "
-                    "بتوقيت نيويورك.\n\n"
-                    "الفحص اليدوي متاح خلال جلسة السوق "
-                    "من 09:30 إلى 16:00.\n\n"
+                    "الفحص التلقائي: 09:40–16:00\n"
+                    "الفحص اليدوي: 09:30–16:00\n"
                     "لم يتم فتح فرص جديدة."
                 )
 
@@ -1278,8 +1149,8 @@ async def run_scan(application, manual=False):
         if daily_count >= MAX_PER_DAY:
 
             return (
-                "وصل البوت إلى الحد الأقصى: "
-                "10 تنبيهات قوية اليوم."
+                f"وصل البوت إلى الحد الأقصى "
+                f"{MAX_PER_DAY} فرص اليوم."
             )
 
         for ticker in TICKERS:
@@ -1292,7 +1163,7 @@ async def run_scan(application, manual=False):
             if ticker in sent_today:
 
                 summary[ticker] = (
-                    "تم إرسال تنبيه لهذا السهم اليوم"
+                    "تم إرسال فرصة لهذا السهم اليوم"
                 )
 
                 continue
@@ -1300,12 +1171,11 @@ async def run_scan(application, manual=False):
             if ticker in active_trades:
 
                 summary[ticker] = (
-                    "لديه فرصة متابعة نشطة"
+                    "توجد فرصة نشطة لهذا السهم"
                 )
 
                 continue
 
-            # تحليل السهم
             analysis = await asyncio.to_thread(
                 analyze_ticker,
                 ticker
@@ -1314,28 +1184,24 @@ async def run_scan(application, manual=False):
             grade = analysis["grade"]
             signal = analysis["signal"]
 
-            # لا دخول
             if not signal:
 
                 summary[ticker] = (
-                    f"{grade} | {analysis['reason']}"
+                    f"لا دخول | {analysis['reason']}"
                 )
 
                 continue
 
-            # الفرص المتوسطة
             if grade == "متوسط":
 
                 medium_seen_today.add(ticker)
 
                 summary[ticker] = (
-                    f"🟡 متوسط {signal} | "
-                    f"{analysis['reason']}"
+                    f"فرصة متوسطة {signal}"
                 )
 
                 continue
 
-            # لا نرسل إلا القوي
             if grade != "قوي":
 
                 summary[ticker] = (
@@ -1346,7 +1212,6 @@ async def run_scan(application, manual=False):
 
             strong_seen_today.add(ticker)
 
-            # محاولة جلب عقد حقيقي
             try:
 
                 contract = await asyncio.to_thread(
@@ -1355,8 +1220,6 @@ async def run_scan(application, manual=False):
                     signal,
                     analysis["underlying"]
                 )
-
-                contract["grade"] = "قوي"
 
                 sent = await open_trade(
                     application,
@@ -1368,56 +1231,37 @@ async def run_scan(application, manual=False):
                 if sent:
 
                     summary[ticker] = (
-                        f"🟢 تم إرسال {signal} قوي\n"
-                        f"{analysis['details']}\n"
-                        f"العقد: {contract['contract']}\n"
-                        f"Ask: ${contract['ask']:.2f}"
+                        f"تم إرسال {signal} بعقد مؤكد "
+                        f"{contract['contract']}"
                     )
 
                 else:
 
                     summary[ticker] = (
-                        "لم يتم إرسال الفرصة"
+                        "لم يتم التسليم: لا يوجد مشترك "
+                        "أو فشل الإرسال أو بلغ الحد اليومي"
                     )
 
             except Exception as e:
 
-                reason = (
-                    f"إشارة قوية لكن تعذر تأكيد العقد: "
-                    f"{str(e)[:200]}"
-                )
+                reason = str(e)[:200]
 
                 errors.append(
                     f"{ticker}: {reason}"
                 )
 
-                # إرسال الإشارة حتى عند فشل العقد
-                sent = await send_signal_without_contract(
-                    application,
-                    ticker,
-                    signal,
-                    analysis,
-                    e
+                # لا نرسل رسالة ناقصة دون استرايك وسعر
+                summary[ticker] = (
+                    "إشارة قوية، لكن لم يتم إرسالها "
+                    "لعدم تأكيد عقد الأوبشن: "
+                    f"{reason}"
                 )
 
-                if sent:
-
-                    summary[ticker] = (
-                        f"⚠️ تم إرسال {signal} قوي "
-                        "دون عقد مؤكد\n"
-                        f"{analysis['details']}\n"
-                        f"السبب: {str(e)[:200]}"
-                    )
-
-                else:
-
-                    summary[ticker] = (
-                        f"{reason}\n"
-                        "لم يتم الإرسال بسبب بلوغ الحد اليومي "
-                        "أو سبق إرسال تنبيه لهذا السهم."
-                    )
-
-                logger.warning("%s", reason)
+                logger.warning(
+                    "%s: تعذر تأكيد العقد: %s",
+                    ticker,
+                    reason
+                )
 
         last_scan_summary = summary
         last_scan_errors = errors
@@ -1425,16 +1269,13 @@ async def run_scan(application, manual=False):
         report = (
             f"انتهى الفحص: "
             f"{now_ny().strftime('%H:%M:%S')} نيويورك\n\n"
-            f"التنبيهات القوية المرسلة: "
+            f"الفرص المرسلة بعقود مؤكدة: "
             f"{daily_count}/{MAX_PER_DAY}\n"
             f"الفرص المتوسطة المرصودة: "
             f"{len(medium_seen_today)}\n"
-            f"عدد الأسهم التي تم فحصها: "
-            f"{len(summary)}\n"
-            f"الصفقات النشطة بعقود مؤكدة: "
-            f"{len(active_trades)}\n"
-            f"أخطاء جلب العقود: "
-            f"{len(errors)}"
+            f"الأسهم التي تم فحصها: {len(summary)}\n"
+            f"الصفقات النشطة: {len(active_trades)}\n"
+            f"أخطاء جلب العقود: {len(errors)}"
         )
 
         logger.info(report)
@@ -1443,7 +1284,7 @@ async def run_scan(application, manual=False):
 
 
 # =====================================================
-# 17. محرك الفحص التلقائي
+# 16. محرك الفحص التلقائي
 # =====================================================
 
 async def scanner_loop(application):
@@ -1478,7 +1319,7 @@ async def scanner_loop(application):
 
 
 # =====================================================
-# 18. أوامر تيليجرام
+# 17. أوامر تيليجرام
 # =====================================================
 
 async def start_command(update, context):
@@ -1489,15 +1330,18 @@ async def start_command(update, context):
 
     await update.message.reply_text(
         "✅ تم تفعيل اشتراكك في Aboghala Bot.\n\n"
-        "البوت يبحث عن فرص CALL وPUT.\n"
-        "يرسل الإشارات القوية حتى إذا تعذر تأكيد العقد، "
-        "مع توضيح أن العقد غير مؤكد.\n"
-        "الفرص المتوسطة تظهر في التشخيص فقط.\n\n"
-        "أوامر البوت:\n"
+        "البوت يبحث عن فرص CALL وPUT بعقود مؤكدة.\n"
+        "تم تخفيف شروط الدخول.\n"
+        "لن يرسل فرصة إذا لم يستطع تحديد الاسترايك "
+        "وسعر العقد.\n\n"
+        "رسالة الفرصة تحتوي على:\n"
+        "الشركة، الاتجاه، الاسترايك، السعر، "
+        "الهدف الأول والثاني، الوقف، والمدة.\n\n"
+        "الأوامر:\n"
         "/scan - فحص السوق\n"
         "/status - حالة البوت\n"
         "/report - تقرير آخر فحص\n"
-        "/debug - أسباب قبول أو رفض الأسهم\n"
+        "/debug - تشخيص الأسهم\n"
         "/active - الصفقات النشطة\n"
         "/help - المساعدة\n\n"
         "⚠️ التنبيهات تحليلية وليست تنفيذًا للصفقات."
@@ -1542,23 +1386,21 @@ async def status_command(update, context):
         f"{now_ny().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"آخر محاولة فحص: {last_scan}\n"
         f"اختبار Yahoo: {yahoo_text}\n"
-        f"تفاصيل Yahoo: "
-        f"{yahoo_status['message'][:250]}\n\n"
-        f"التنبيهات القوية المرسلة اليوم: "
-        f"{daily_count}/{MAX_PER_DAY}\n"
-        f"الفرص المتوسطة المرصودة اليوم: "
-        f"{len(medium_seen_today)}\n"
-        f"الصفقات النشطة بعقود مؤكدة: "
-        f"{len(active_trades)}\n"
+        f"تفاصيل Yahoo: {yahoo_status['message'][:200]}\n\n"
+        f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}\n"
+        f"الفرص المتوسطة المرصودة: {len(medium_seen_today)}\n"
+        f"الصفقات النشطة: {len(active_trades)}\n"
         f"المشتركون: {len(subscribers)}\n"
         f"عدد الأسهم: {len(TICKERS)}\n\n"
-        f"السوق ضمن وقت البحث التلقائي: "
+        "شروط الاتجاه: 2 من 3\n"
+        f"حجم التداول الأدنى: {MIN_VOLUME_RATIO}x\n"
+        f"RSI CALL: {CALL_RSI_MIN}–{CALL_RSI_MAX}\n"
+        f"RSI PUT: {PUT_RSI_MIN}–{PUT_RSI_MAX}\n\n"
+        f"الفحص التلقائي: "
         f"{'نعم' if market_is_open_for_scanning() else 'لا'}\n"
-        "نافذة الفحص التلقائي: 09:40–16:00 نيويورك\n"
-        "الفحص اليدوي: خلال جلسة السوق 09:30–16:00\n"
-        "إيقاف متابعة العقود: 16:00 نيويورك\n\n"
-        "ملاحظة: عدد التنبيهات يشمل الإشارات "
-        "التي أُرسلت دون عقد مؤكد."
+        "وقت الفحص التلقائي: 09:40–16:00 نيويورك\n"
+        "الفحص اليدوي: 09:30–16:00 نيويورك\n"
+        "نهاية متابعة العقود: 16:00 نيويورك"
     )
 
 
@@ -1574,9 +1416,8 @@ async def report_command(update, context):
 
     lines = [
         "📋 تقرير آخر فحص",
-        f"الوقت: "
-        f"{last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"التنبيهات القوية: {daily_count}/{MAX_PER_DAY}",
+        f"الوقت: {last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"الفرص المرسلة: {daily_count}/{MAX_PER_DAY}",
         f"الفرص المتوسطة: {len(medium_seen_today)}",
         ""
     ]
@@ -1608,10 +1449,11 @@ async def debug_command(update, context):
 
     lines = [
         "🔬 تشخيص الأسهم\n",
-        "🟢 قوي: يرسل تنبيهًا عند توفر عقد مؤكد.",
-        "⚠️ قوي دون عقد: يرسل إشارة السهم دون سعر دخول أو أهداف.",
-        "🟡 متوسط: لا يرسل تنبيهًا.",
-        "🔴 لا دخول: الشروط غير مكتملة."
+        "شروط الدخول مخففة: تحقق شرطين من ثلاثة للاتجاه.",
+        f"الحد الأدنى للحجم: {MIN_VOLUME_RATIO}x",
+        f"RSI CALL: {CALL_RSI_MIN}–{CALL_RSI_MAX}",
+        f"RSI PUT: {PUT_RSI_MIN}–{PUT_RSI_MAX}",
+        "لا يتم إرسال فرصة إلا بعد تأكيد عقد الأوبشن."
     ]
 
     for ticker, reason in last_scan_summary.items():
@@ -1637,15 +1479,16 @@ async def active_command(update, context):
 
     for ticker, trade in active_trades.items():
 
+        entry = trade["entry"]
+
         lines.append(
             f"\n{ticker} {trade['type']}\n"
-            f"العقد: {trade['contract']}\n"
-            f"الانتهاء: {trade['expiration']}\n"
-            f"الدخول: ${trade['entry']:.2f}\n"
-            f"الهدف الأول: "
-            f"{'تم' if trade['tp1_sent'] else 'لم يتحقق'}\n"
-            f"الهدف الثاني: "
-            f"{'تم' if trade['tp2_sent'] else 'لم يتحقق'}"
+            f"الاسترايك: ${trade['strike']:.2f}\n"
+            f"سعر الدخول: ${entry:.2f}\n"
+            f"الهدف الأول: ${entry * 1.30:.2f}\n"
+            f"الهدف الثاني: ${entry * 1.60:.2f}\n"
+            f"الوقف: ${entry * 0.65:.2f}\n"
+            f"الانتهاء: {trade['expiration']}"
         )
 
     await reply_long(
@@ -1668,7 +1511,7 @@ async def help_command(update, context):
 
 
 # =====================================================
-# 19. بدء المهام
+# 18. بدء المهام
 # =====================================================
 
 async def post_init(application):
@@ -1685,7 +1528,7 @@ async def post_init(application):
 
 
 # =====================================================
-# 20. خادم Render
+# 19. خادم Render
 # =====================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -1739,7 +1582,7 @@ def start_health_server():
 
 
 # =====================================================
-# 21. تشغيل البوت
+# 20. تشغيل البوت
 # =====================================================
 
 def main():
