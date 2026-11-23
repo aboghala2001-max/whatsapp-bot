@@ -146,12 +146,6 @@ SCAN_BATCH_SIZE = 12
 SCAN_INTERVAL = 180
 MONITOR_INTERVAL = 60
 
-# توزيع الدفعة:
-# 6 سيولة، 3 ارتفاع حجم التداول، 3 الأقدم فحصًا.
-LIQUIDITY_PRIORITY_SLOTS = 6
-VOLUME_SURGE_PRIORITY_SLOTS = 3
-OLDEST_SCAN_PRIORITY_SLOTS = 3
-
 # منع تكرار السهم في دفعات متقاربة
 SCAN_REPEAT_COOLDOWN = 15 * 60
 
@@ -557,32 +551,33 @@ def refresh_priority_metrics():
 
 
 # =====================================================
-# 4.2 اختيار الدفعة حسب الأولوية
+# 4.2 اختيار أفضل 12 سهمًا حسب السيولة وحجم التداول
 # =====================================================
 
 def get_priority_batch():
 
     """
-    يوزع كل دفعة من 12 سهمًا كالتالي:
+    يختار أفضل 12 سهمًا بترتيب موحّد:
 
-    6 أسهم: أعلى متوسط قيمة تداول.
-    3 أسهم: أعلى ارتفاع في حجم التداول.
-    3 أسهم: الأقدم منذ آخر فحص.
+    - 50% لترتيب السيولة (متوسط قيمة التداول بالدولار).
+    - 50% لترتيب نشاط حجم التداول (Volume Ratio).
 
-    يمنع تكرار السهم في دفعات متقاربة.
+    لا توجد مجموعات منفصلة أو حصص ثابتة.
+
+    يمنع تكرار السهم لمدة 15 دقيقة.
+    وإذا لم يتوفر 12 سهمًا بعد التبريد،
+    يستكمل العدد بالأسهم الأقدم فحصًا.
     """
 
     now_timestamp = time_module.time()
 
-    total = len(TICKERS)
-
-    if total == 0:
+    if not TICKERS:
         return []
 
-    selected = []
-    selected_set = set()
+    # -------------------------------------------------
+    # 1. استبعاد الأسهم التي لم تنتهِ مدة التبريد لها
+    # -------------------------------------------------
 
-    # استبعاد الأسهم التي فُحصت خلال آخر 15 دقيقة
     eligible = []
 
     for ticker in TICKERS:
@@ -597,11 +592,12 @@ def get_priority_batch():
         elapsed = now_timestamp - last_scan
 
         if elapsed >= SCAN_REPEAT_COOLDOWN:
-
             eligible.append(ticker)
 
-    # إذا لم تتوفر أسهم كافية بعد فترة المنع،
-    # نسمح باستكمال الدفعة بالأقدم فحصًا.
+    # -------------------------------------------------
+    # 2. استكمال العدد بالأقدم فحصًا عند الحاجة
+    # -------------------------------------------------
+
     if len(eligible) < SCAN_BATCH_SIZE:
 
         remaining = [
@@ -611,138 +607,137 @@ def get_priority_batch():
         ]
 
         remaining.sort(
-            key=lambda ticker: LAST_TICKER_SCAN.get(
+            key=lambda ticker: (
+                LAST_TICKER_SCAN.get(ticker, 0),
+                TICKERS.index(ticker)
+            )
+        )
+
+        needed = SCAN_BATCH_SIZE - len(eligible)
+
+        eligible.extend(
+            remaining[:needed]
+        )
+
+    if not eligible:
+        return []
+
+    # -------------------------------------------------
+    # 3. تجهيز بيانات السيولة وحجم التداول
+    # -------------------------------------------------
+
+    metrics_rows = []
+
+    for ticker in eligible:
+
+        metrics = PRIORITY_METRICS.get(ticker, {})
+
+        avg_dollar_volume = safe_float(
+            metrics.get("avg_dollar_volume", 0)
+        )
+
+        volume_ratio = safe_float(
+            metrics.get("volume_ratio", 0)
+        )
+
+        if avg_dollar_volume is None:
+            avg_dollar_volume = 0.0
+
+        if volume_ratio is None:
+            volume_ratio = 0.0
+
+        metrics_rows.append({
+            "ticker": ticker,
+            "avg_dollar_volume": max(
+                avg_dollar_volume,
+                0.0
+            ),
+            "volume_ratio": max(
+                volume_ratio,
+                0.0
+            )
+        })
+
+    metrics_df = pd.DataFrame(metrics_rows)
+
+    # -------------------------------------------------
+    # 4. ترتيب السيولة وحجم التداول بشكل نسبي
+    # -------------------------------------------------
+
+    metrics_df["liquidity_rank"] = (
+        metrics_df["avg_dollar_volume"].rank(
+            method="average",
+            pct=True
+        )
+    )
+
+    metrics_df["volume_rank"] = (
+        metrics_df["volume_ratio"].rank(
+            method="average",
+            pct=True
+        )
+    )
+
+    # -------------------------------------------------
+    # 5. الدرجة الموحدة: 50% سيولة + 50% حجم تداول
+    # -------------------------------------------------
+
+    metrics_df["combined_score"] = (
+        metrics_df["liquidity_rank"] * 0.50
+        +
+        metrics_df["volume_rank"] * 0.50
+    )
+
+    # -------------------------------------------------
+    # 6. كسر التعادل بالسيولة ثم الحجم ثم الأقدم فحصًا
+    # -------------------------------------------------
+
+    metrics_df["last_scan"] = (
+        metrics_df["ticker"].map(
+            lambda ticker: LAST_TICKER_SCAN.get(
                 ticker,
                 0
             )
         )
-
-        eligible.extend(remaining)
-
-    def add_candidates(candidates, count):
-
-        for ticker in candidates:
-
-            if len(selected) >= SCAN_BATCH_SIZE:
-                break
-
-            if ticker in selected_set:
-                continue
-
-            if ticker not in eligible:
-                continue
-
-            selected.append(ticker)
-            selected_set.add(ticker)
-
-            if len(selected) >= SCAN_BATCH_SIZE:
-                break
-
-    # -------------------------------------------------
-    # الفئة الأولى: أعلى متوسط قيمة تداول
-    # -------------------------------------------------
-
-    liquidity_candidates = sorted(
-        eligible,
-        key=lambda ticker: (
-            PRIORITY_METRICS.get(
-                ticker,
-                {}
-            ).get("avg_dollar_volume", 0),
-
-            PRIORITY_METRICS.get(
-                ticker,
-                {}
-            ).get("volume_ratio", 0)
-        ),
-        reverse=True
     )
 
-    add_candidates(
-        liquidity_candidates,
-        LIQUIDITY_PRIORITY_SLOTS
-    )
-
-    # -------------------------------------------------
-    # الفئة الثانية: أعلى ارتفاع في حجم التداول
-    # -------------------------------------------------
-
-    volume_candidates = sorted(
-        eligible,
-        key=lambda ticker: (
-            PRIORITY_METRICS.get(
-                ticker,
-                {}
-            ).get("volume_ratio", 0),
-
-            PRIORITY_METRICS.get(
-                ticker,
-                {}
-            ).get("avg_dollar_volume", 0),
-
-            PRIORITY_METRICS.get(
-                ticker,
-                {}
-            ).get("atr_percent", 0)
-        ),
-        reverse=True
-    )
-
-    add_candidates(
-        volume_candidates,
-        VOLUME_SURGE_PRIORITY_SLOTS
-    )
-
-    # -------------------------------------------------
-    # الفئة الثالثة: الأسهم الأقدم فحصًا
-    # -------------------------------------------------
-
-    oldest_candidates = sorted(
-        eligible,
-        key=lambda ticker: (
-            LAST_TICKER_SCAN.get(ticker, 0),
-            -PRIORITY_METRICS.get(
-                ticker,
-                {}
-            ).get("avg_dollar_volume", 0)
+    metrics_df["original_order"] = (
+        metrics_df["ticker"].map(
+            lambda ticker: TICKERS.index(ticker)
         )
     )
 
-    add_candidates(
-        oldest_candidates,
-        OLDEST_SCAN_PRIORITY_SLOTS
+    metrics_df = metrics_df.sort_values(
+        by=[
+            "combined_score",
+            "liquidity_rank",
+            "volume_rank",
+            "avg_dollar_volume",
+            "volume_ratio",
+            "last_scan",
+            "original_order"
+        ],
+        ascending=[
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True
+        ],
+        kind="stable"
     )
 
-    # -------------------------------------------------
-    # استكمال أي أماكن فارغة
-    # -------------------------------------------------
-
-    if len(selected) < SCAN_BATCH_SIZE:
-
-        remaining_candidates = sorted(
-            eligible,
-            key=lambda ticker: (
-                -PRIORITY_METRICS.get(
-                    ticker,
-                    {}
-                ).get("avg_dollar_volume", 0),
-
-                -PRIORITY_METRICS.get(
-                    ticker,
-                    {}
-                ).get("volume_ratio", 0),
-
-                LAST_TICKER_SCAN.get(ticker, 0)
-            )
-        )
-
-        add_candidates(
-            remaining_candidates,
-            SCAN_BATCH_SIZE - len(selected)
-        )
+    selected = (
+        metrics_df["ticker"]
+        .head(SCAN_BATCH_SIZE)
+        .tolist()
+    )
 
     logger.info(
-        "تم اختيار دفعة الأولوية: %s",
+        "تم اختيار أفضل %s سهمًا حسب الترتيب الموحد للسيولة وحجم التداول: %s",
+        len(selected),
         ", ".join(selected)
     )
 
@@ -2110,11 +2105,11 @@ async def run_scan(application, manual=False):
             refresh_priority_metrics
         )
 
-        # اختيار الأسهم حسب السيولة والحجم والأقدم فحصًا
+        # اختيار أفضل 12 سهمًا حسب الترتيب الموحد للسيولة وحجم التداول
         batch = get_priority_batch()
 
         logger.info(
-            "بدء فحص دفعة الأولوية | عدد الأسهم: %s",
+            "بدء فحص دفعة أفضل الأسهم | عدد الأسهم: %s",
             len(batch)
         )
 
@@ -2239,8 +2234,9 @@ async def run_scan(application, manual=False):
         report = (
             "📊 انتهى فحص الدفعة\n\n"
             "طريقة التحليل: كل سهم مستقل.\n"
-            "ترتيب الأسهم: السيولة وحجم التداول والأقدم فحصًا.\n"
-            "توزيع الدفعة: 6 سيولة، 3 ارتفاع حجم، 3 الأقدم فحصًا.\n"
+            "ترتيب الأسهم: أفضل 12 حسب السيولة وحجم التداول بترتيب موحّد.\n"
+            "التحديث: كل 3 دقائق.\n"
+            "منع التكرار: 15 دقيقة، مع استكمال العدد بالأقدم فحصًا عند الحاجة.\n"
             "الأهداف: مقاومات فنية وإسقاط ATR عند الحاجة.\n"
             f"الفرص المرسلة: {daily_count}/{MAX_PER_DAY}\n"
             f"الأسهم في هذه الدفعة: {len(summary)}\n"
@@ -2391,9 +2387,10 @@ async def status_command(update, context):
         f"متابعة الصفقات كل: {MONITOR_INTERVAL} ثانية\n\n"
 
         "أولوية الفحص:\n"
-        "6 أسهم حسب السيولة، 3 حسب ارتفاع حجم التداول، "
-        "3 حسب الأقدم فحصًا.\n"
-        f"منع تكرار السهم لمدة: {SCAN_REPEAT_COOLDOWN // 60} دقيقة.\n\n"
+        "أفضل 12 سهمًا بترتيب موحّد يجمع السيولة وحجم التداول، "
+        "بنسبة 50% لكل منهما.\n"
+        f"منع تكرار السهم لمدة: {SCAN_REPEAT_COOLDOWN // 60} دقيقة.\n"
+        "عند عدم توفر 12 سهمًا بعد التبريد، يُستكمل العدد بالأقدم فحصًا.\n\n"
 
         f"الفحص التلقائي الآن: {'نعم' if scan_allowed else 'لا'}\n"
         "الفحص التلقائي مجدول: نعم\n\n"
@@ -2417,7 +2414,10 @@ async def report_command(update, context):
         "📋 تقرير آخر فحص",
         f"الوقت السعودي: {last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
         "طريقة التحليل: كل سهم مستقل.",
-        "ترتيب الأسهم: السيولة وحجم التداول والأقدم فحصًا.",
+        "ترتيب الأسهم: أفضل 12 حسب السيولة وحجم التداول بترتيب موحّد.",
+        "وزن السيولة: 50%، ووزن حجم التداول: 50%.",
+        "التحديث: كل 3 دقائق.",
+        "منع التكرار: 15 دقيقة، والاستكمال بالأقدم فحصًا عند الحاجة.",
         "الأهداف: مقاومات فنية وإسقاط ATR عند الحاجة.",
         f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}",
         f"عدد الأسهم في القائمة: {len(TICKERS)}",
