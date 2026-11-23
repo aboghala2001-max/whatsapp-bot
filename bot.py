@@ -2,6 +2,7 @@ import os
 import asyncio
 import yfinance as yf
 print("YFINANCE VERSION:", yf.__version__)
+print("YFINANCE VERSION:", yf.__version__)
 import logging
 import threading
 import math
