@@ -146,6 +146,18 @@ SCAN_BATCH_SIZE = 12
 SCAN_INTERVAL = 180
 MONITOR_INTERVAL = 60
 
+# توزيع الدفعة:
+# 6 سيولة، 3 ارتفاع حجم التداول، 3 الأقدم فحصًا.
+LIQUIDITY_PRIORITY_SLOTS = 6
+VOLUME_SURGE_PRIORITY_SLOTS = 3
+OLDEST_SCAN_PRIORITY_SLOTS = 3
+
+# منع تكرار السهم في دفعات متقاربة
+SCAN_REPEAT_COOLDOWN = 15 * 60
+
+# عدد شموع 5 دقائق المستخدمة في حساب الأولويات
+PRIORITY_LOOKBACK_BARS = 20
+
 # نافذة السعودية: 17:00 إلى 00:00
 SAUDI_SCAN_START = time(17, 0)
 SAUDI_SCAN_END = time(0, 0)
@@ -179,7 +191,10 @@ PRICE_CACHE_TTL = 30
 NO_DATA_CACHE = {}
 NO_DATA_CACHE_TTL = 20 * 60
 
-scan_cursor = 0
+# بيانات أولوية الأسهم
+PRIORITY_METRICS = {}
+LAST_TICKER_SCAN = {}
+priority_updated_at = None
 
 
 # =====================================================
@@ -245,8 +260,6 @@ def saudi_time_is_allowed():
 
     current_time = now_saudi().time()
 
-    # نافذة تعبر منتصف الليل:
-    # من 17:00 حتى ما قبل 00:00
     return (
         current_time >= SAUDI_SCAN_START
         or current_time < SAUDI_SCAN_END
@@ -277,27 +290,463 @@ def market_is_open_for_scanning():
     return START_SCAN_NY <= now.time() <= STOP_NEW_TRADES_NY
 
 
-def get_next_batch():
+# =====================================================
+# 4.1 تحديث بيانات أولوية جميع الأسهم
+# =====================================================
 
-    global scan_cursor
+def refresh_priority_metrics():
+
+    """
+    يجلب بيانات 5 دقائق لجميع الأسهم دفعة واحدة،
+    ويحسب لكل سهم:
+
+    - متوسط قيمة التداول بالدولار.
+    - ارتفاع حجم التداول مقارنة بمتوسطه.
+    - ATR كنسبة من السعر.
+
+    هذه البيانات تستخدم لترتيب أولوية الفحص فقط.
+    """
+
+    global PRIORITY_METRICS
+    global priority_updated_at
+
+    try:
+
+        with YAHOO_LOCK:
+
+            raw = yf.download(
+                tickers=TICKERS,
+                period="1d",
+                interval="5m",
+                group_by="ticker",
+                auto_adjust=False,
+                prepost=False,
+                threads=True,
+                progress=False,
+                timeout=30
+            )
+
+        if raw is None or raw.empty:
+
+            logger.warning(
+                "لم تصل بيانات تحديث أولويات الأسهم من Yahoo"
+            )
+
+            return False
+
+        updated_metrics = {}
+        current_time = now_ny()
+
+        for ticker in TICKERS:
+
+            try:
+
+                # استخراج بيانات السهم من نتيجة Yahoo
+                if isinstance(raw.columns, pd.MultiIndex):
+
+                    level0 = raw.columns.get_level_values(0)
+                    level1 = raw.columns.get_level_values(1)
+
+                    if ticker in level0:
+
+                        stock_df = raw[ticker].copy()
+
+                    elif ticker in level1:
+
+                        stock_df = raw.xs(
+                            ticker,
+                            axis=1,
+                            level=1
+                        ).copy()
+
+                    else:
+
+                        continue
+
+                else:
+
+                    if len(TICKERS) != 1:
+                        continue
+
+                    stock_df = raw.copy()
+
+                required = [
+                    "High",
+                    "Low",
+                    "Close",
+                    "Volume"
+                ]
+
+                if not all(
+                    col in stock_df.columns
+                    for col in required
+                ):
+                    continue
+
+                stock_df = stock_df[required].copy()
+                stock_df = stock_df.dropna()
+
+                if stock_df.empty:
+                    continue
+
+                if not isinstance(
+                    stock_df.index,
+                    pd.DatetimeIndex
+                ):
+                    continue
+
+                if stock_df.index.tz is None:
+
+                    stock_df.index = (
+                        stock_df.index.tz_localize(TZ_NY)
+                    )
+
+                else:
+
+                    stock_df.index = (
+                        stock_df.index.tz_convert(TZ_NY)
+                    )
+
+                stock_df = stock_df.sort_index()
+
+                # استبعاد شمعة 5 دقائق غير المكتملة
+                candle_close = (
+                    stock_df.index + timedelta(minutes=5)
+                )
+
+                stock_df = stock_df.loc[
+                    candle_close <= (
+                        current_time - timedelta(seconds=30)
+                    )
+                ]
+
+                if len(stock_df) < 5:
+                    continue
+
+                stock_df = stock_df[
+                    (stock_df["Close"] > 0)
+                    & (stock_df["Volume"] >= 0)
+                ]
+
+                if len(stock_df) < 5:
+                    continue
+
+                close = stock_df["Close"].astype(float)
+                high = stock_df["High"].astype(float)
+                low = stock_df["Low"].astype(float)
+                volume = stock_df["Volume"].astype(float)
+
+                latest_close = safe_float(close.iloc[-1])
+                latest_volume = safe_float(volume.iloc[-1])
+
+                if (
+                    latest_close is None
+                    or latest_volume is None
+                    or latest_close <= 0
+                ):
+                    continue
+
+                # متوسط قيمة التداول بالدولار
+                # السعر × الحجم
+                dollar_volume = close * volume
+
+                avg_dollar_volume = safe_float(
+                    dollar_volume.tail(
+                        PRIORITY_LOOKBACK_BARS
+                    ).mean()
+                )
+
+                # حجم آخر شمعة مقارنة بمتوسط الشموع السابقة
+                previous_volumes = volume.iloc[
+                    -PRIORITY_LOOKBACK_BARS - 1:-1
+                ]
+
+                if previous_volumes.empty:
+
+                    volume_ratio = 0.0
+
+                else:
+
+                    average_volume = safe_float(
+                        previous_volumes.mean()
+                    )
+
+                    if (
+                        average_volume is None
+                        or average_volume <= 0
+                    ):
+
+                        volume_ratio = 0.0
+
+                    else:
+
+                        volume_ratio = (
+                            latest_volume / average_volume
+                        )
+
+                # حساب ATR من بيانات 5 دقائق
+                previous_close = close.shift(1)
+
+                tr1 = high - low
+
+                tr2 = (
+                    high - previous_close
+                ).abs()
+
+                tr3 = (
+                    low - previous_close
+                ).abs()
+
+                true_range = pd.concat(
+                    [tr1, tr2, tr3],
+                    axis=1
+                ).max(axis=1)
+
+                atr = safe_float(
+                    true_range.tail(14).mean()
+                )
+
+                if atr is None or atr <= 0:
+                    atr = 0.0
+
+                atr_percent = (
+                    atr / latest_close * 100
+                )
+
+                if avg_dollar_volume is None:
+                    continue
+
+                updated_metrics[ticker] = {
+                    "avg_dollar_volume": avg_dollar_volume,
+                    "volume_ratio": volume_ratio,
+                    "atr": atr,
+                    "atr_percent": atr_percent,
+                    "price": latest_close,
+                    "timestamp": time_module.time()
+                }
+
+            except Exception as e:
+
+                logger.debug(
+                    "تعذر حساب أولوية %s: %s",
+                    ticker,
+                    str(e)[:120]
+                )
+
+        # الاحتفاظ بالبيانات السابقة للأسهم التي لم تصل بياناتها
+        # وعدم استبدالها بنتيجة فارغة.
+        PRIORITY_METRICS.update(updated_metrics)
+
+        priority_updated_at = time_module.time()
+
+        logger.info(
+            "تم تحديث أولويات %s من أصل %s سهمًا",
+            len(updated_metrics),
+            len(TICKERS)
+        )
+
+        return bool(updated_metrics)
+
+    except Exception:
+
+        logger.exception(
+            "فشل تحديث بيانات أولوية الأسهم"
+        )
+
+        return False
+
+
+# =====================================================
+# 4.2 اختيار الدفعة حسب الأولوية
+# =====================================================
+
+def get_priority_batch():
+
+    """
+    يوزع كل دفعة من 12 سهمًا كالتالي:
+
+    6 أسهم: أعلى متوسط قيمة تداول.
+    3 أسهم: أعلى ارتفاع في حجم التداول.
+    3 أسهم: الأقدم منذ آخر فحص.
+
+    يمنع تكرار السهم في دفعات متقاربة.
+    """
+
+    now_timestamp = time_module.time()
 
     total = len(TICKERS)
 
     if total == 0:
         return []
 
-    batch = []
+    selected = []
+    selected_set = set()
 
-    for i in range(min(SCAN_BATCH_SIZE, total)):
+    # استبعاد الأسهم التي فُحصت خلال آخر 15 دقيقة
+    eligible = []
 
-        index = (scan_cursor + i) % total
-        batch.append(TICKERS[index])
+    for ticker in TICKERS:
 
-    scan_cursor = (
-        scan_cursor + SCAN_BATCH_SIZE
-    ) % total
+        last_scan = LAST_TICKER_SCAN.get(ticker)
 
-    return batch
+        if last_scan is None:
+
+            eligible.append(ticker)
+            continue
+
+        elapsed = now_timestamp - last_scan
+
+        if elapsed >= SCAN_REPEAT_COOLDOWN:
+
+            eligible.append(ticker)
+
+    # إذا لم تتوفر أسهم كافية بعد فترة المنع،
+    # نسمح باستكمال الدفعة بالأقدم فحصًا.
+    if len(eligible) < SCAN_BATCH_SIZE:
+
+        remaining = [
+            ticker
+            for ticker in TICKERS
+            if ticker not in eligible
+        ]
+
+        remaining.sort(
+            key=lambda ticker: LAST_TICKER_SCAN.get(
+                ticker,
+                0
+            )
+        )
+
+        eligible.extend(remaining)
+
+    def add_candidates(candidates, count):
+
+        for ticker in candidates:
+
+            if len(selected) >= SCAN_BATCH_SIZE:
+                break
+
+            if ticker in selected_set:
+                continue
+
+            if ticker not in eligible:
+                continue
+
+            selected.append(ticker)
+            selected_set.add(ticker)
+
+            if len(selected) >= SCAN_BATCH_SIZE:
+                break
+
+    # -------------------------------------------------
+    # الفئة الأولى: أعلى متوسط قيمة تداول
+    # -------------------------------------------------
+
+    liquidity_candidates = sorted(
+        eligible,
+        key=lambda ticker: (
+            PRIORITY_METRICS.get(
+                ticker,
+                {}
+            ).get("avg_dollar_volume", 0),
+
+            PRIORITY_METRICS.get(
+                ticker,
+                {}
+            ).get("volume_ratio", 0)
+        ),
+        reverse=True
+    )
+
+    add_candidates(
+        liquidity_candidates,
+        LIQUIDITY_PRIORITY_SLOTS
+    )
+
+    # -------------------------------------------------
+    # الفئة الثانية: أعلى ارتفاع في حجم التداول
+    # -------------------------------------------------
+
+    volume_candidates = sorted(
+        eligible,
+        key=lambda ticker: (
+            PRIORITY_METRICS.get(
+                ticker,
+                {}
+            ).get("volume_ratio", 0),
+
+            PRIORITY_METRICS.get(
+                ticker,
+                {}
+            ).get("avg_dollar_volume", 0),
+
+            PRIORITY_METRICS.get(
+                ticker,
+                {}
+            ).get("atr_percent", 0)
+        ),
+        reverse=True
+    )
+
+    add_candidates(
+        volume_candidates,
+        VOLUME_SURGE_PRIORITY_SLOTS
+    )
+
+    # -------------------------------------------------
+    # الفئة الثالثة: الأسهم الأقدم فحصًا
+    # -------------------------------------------------
+
+    oldest_candidates = sorted(
+        eligible,
+        key=lambda ticker: (
+            LAST_TICKER_SCAN.get(ticker, 0),
+            -PRIORITY_METRICS.get(
+                ticker,
+                {}
+            ).get("avg_dollar_volume", 0)
+        )
+    )
+
+    add_candidates(
+        oldest_candidates,
+        OLDEST_SCAN_PRIORITY_SLOTS
+    )
+
+    # -------------------------------------------------
+    # استكمال أي أماكن فارغة
+    # -------------------------------------------------
+
+    if len(selected) < SCAN_BATCH_SIZE:
+
+        remaining_candidates = sorted(
+            eligible,
+            key=lambda ticker: (
+                -PRIORITY_METRICS.get(
+                    ticker,
+                    {}
+                ).get("avg_dollar_volume", 0),
+
+                -PRIORITY_METRICS.get(
+                    ticker,
+                    {}
+                ).get("volume_ratio", 0),
+
+                LAST_TICKER_SCAN.get(ticker, 0)
+            )
+        )
+
+        add_candidates(
+            remaining_candidates,
+            SCAN_BATCH_SIZE - len(selected)
+        )
+
+    logger.info(
+        "تم اختيار دفعة الأولوية: %s",
+        ", ".join(selected)
+    )
+
+    return selected
 
 
 # =====================================================
@@ -827,8 +1276,6 @@ def calculate_trade_levels(entry, atr, df):
 
     else:
 
-        # عند عدم وجود مقاومة مناسبة نستخدم ATR
-        # بوصفه إسقاطًا مبنيًا على تذبذب السهم.
         target1 = ceil_cent(
             max(
                 minimum_target1,
@@ -838,7 +1285,6 @@ def calculate_trade_levels(entry, atr, df):
 
         target1_source = "إسقاط ATR"
 
-    # فحص نسبة الهدف الأول
     rr1 = (
         target1 - entry
     ) / risk
@@ -866,8 +1312,6 @@ def calculate_trade_levels(entry, atr, df):
 
     else:
 
-        # إذا لم توجد مقاومة ثانية مناسبة
-        # نستخدم إسقاطًا مبنيًا على ATR.
         target2 = ceil_cent(
             max(
                 minimum_target2,
@@ -1656,16 +2100,21 @@ async def run_scan(application, manual=False):
                 f"{MAX_PER_DAY} فرص."
             )
 
-        # تسجيل وقت الفحص بعد اجتياز شروط الوقت
         last_scan_time = now_saudi()
 
         summary = {}
         errors = []
 
-        batch = get_next_batch()
+        # تحديث بيانات الأولويات قبل اختيار الدفعة
+        await asyncio.to_thread(
+            refresh_priority_metrics
+        )
+
+        # اختيار الأسهم حسب السيولة والحجم والأقدم فحصًا
+        batch = get_priority_batch()
 
         logger.info(
-            "بدء فحص دفعة مستقلة | عدد الأسهم: %s",
+            "بدء فحص دفعة الأولوية | عدد الأسهم: %s",
             len(batch)
         )
 
@@ -1675,6 +2124,9 @@ async def run_scan(application, manual=False):
 
             if daily_count >= MAX_PER_DAY:
                 break
+
+            # تسجيل وقت فحص السهم لمنع تكراره في دفعات متقاربة
+            LAST_TICKER_SCAN[ticker] = time_module.time()
 
             if ticker in sent_today:
 
@@ -1787,6 +2239,8 @@ async def run_scan(application, manual=False):
         report = (
             "📊 انتهى فحص الدفعة\n\n"
             "طريقة التحليل: كل سهم مستقل.\n"
+            "ترتيب الأسهم: السيولة وحجم التداول والأقدم فحصًا.\n"
+            "توزيع الدفعة: 6 سيولة، 3 ارتفاع حجم، 3 الأقدم فحصًا.\n"
             "الأهداف: مقاومات فنية وإسقاط ATR عند الحاجة.\n"
             f"الفرص المرسلة: {daily_count}/{MAX_PER_DAY}\n"
             f"الأسهم في هذه الدفعة: {len(summary)}\n"
@@ -1936,6 +2390,11 @@ async def status_command(update, context):
         f"الفحص كل: {SCAN_INTERVAL // 60} دقائق تقريبًا\n"
         f"متابعة الصفقات كل: {MONITOR_INTERVAL} ثانية\n\n"
 
+        "أولوية الفحص:\n"
+        "6 أسهم حسب السيولة، 3 حسب ارتفاع حجم التداول، "
+        "3 حسب الأقدم فحصًا.\n"
+        f"منع تكرار السهم لمدة: {SCAN_REPEAT_COOLDOWN // 60} دقيقة.\n\n"
+
         f"الفحص التلقائي الآن: {'نعم' if scan_allowed else 'لا'}\n"
         "الفحص التلقائي مجدول: نعم\n\n"
 
@@ -1958,6 +2417,7 @@ async def report_command(update, context):
         "📋 تقرير آخر فحص",
         f"الوقت السعودي: {last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
         "طريقة التحليل: كل سهم مستقل.",
+        "ترتيب الأسهم: السيولة وحجم التداول والأقدم فحصًا.",
         "الأهداف: مقاومات فنية وإسقاط ATR عند الحاجة.",
         f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}",
         f"عدد الأسهم في القائمة: {len(TICKERS)}",
