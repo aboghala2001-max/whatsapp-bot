@@ -8,8 +8,9 @@ import pytz
 import asyncio
 import urllib.request
 import urllib.parse
+import json
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SAUDI_TZ = pytz.timezone("Asia/Riyadh")
 
@@ -25,10 +26,10 @@ def run_web_server():
     port = int(os.getenv("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-def send_msg(text):
+def send_msg(text, chat_id=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
+        data = urllib.parse.urlencode({"chat_id": chat_id or CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(url, data=data)
         with urllib.request.urlopen(req, timeout=10) as resp:
             print(f"Sent OK: {resp.status}")
@@ -127,6 +128,42 @@ def check_stock(ticker):
         return ("bounce", msg)
     return None
 
+last_update_id = 0
+
+def get_updates():
+    global last_update_id
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=5&offset={last_update_id+1}"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("result", [])
+    except Exception as e:
+        print(f"getUpdates error: {e}")
+        return []
+
+async def listen_commands():
+    global last_update_id
+    while True:
+        for upd in get_updates():
+            last_update_id = upd["update_id"]
+            msg = upd.get("message", {})
+            text = (msg.get("text") or "").strip()
+            chat = str(msg.get("chat", {}).get("id", ""))
+            if not text:
+                continue
+            print(f"Received: {text} from {chat}")
+            if text in ["/start", "start", "السلام عليكم", "هلا"]:
+                send_msg("✅ هلا فيك! البوت شغال.\nارسل /الحالة عشان تشوف الحالة.", chat)
+            elif text in ["/status", "/الحالة", "الحالة", "حالة"]:
+                now = datetime.now(SAUDI_TZ)
+                work = "داخل وقت العمل (5م-12ص) ✅" if is_work_time() else "خارج وقت العمل (5م-12ص) ⏸️ - الفرص متوقفة، بس انا ارد عليك"
+                send_msg(f"📊 الحالة:\nالوقت: {now.strftime('%I:%M %p')}\n{work}\nفرص قوية اليوم: {alerts_count['strong']}/3\nفرص متوسطة: {alerts_count['medium']}/3\nفرص ارتداد: {alerts_count['bounce']}/3\nعدد الأسهم المراقبة: {len(WATCHLIST)}", chat)
+            elif text in ["/id", "رقمي", "ايدي"]:
+                send_msg(f"رقمك هو: {chat}", chat)
+            else:
+                send_msg("وصلتني رسالتك 👍\nاكتب /الحالة عشان تشوف حالة البوت.", chat)
+        await asyncio.sleep(2)
+
 async def main_loop():
     while True:
         reset_daily()
@@ -148,12 +185,12 @@ async def main_loop():
             print("انتهت الجولة، انتظار 5 دقايق...")
             await asyncio.sleep(300)
         else:
-            print("خارج وقت العمل 5م - 12ص، انتظار...")
+            print("خارج وقت العمل 5م - 12ص، انتظار فرص...")
             await asyncio.sleep(300)
 
 async def test_start():
     send_msg("✅ البوت اشتغل واتصل فيك بنجاح")
-    await main_loop()
+    await asyncio.gather(main_loop(), listen_commands())
 
 if __name__ == "__main__":
     threading.Thread(target=run_web_server, daemon=True).start()
