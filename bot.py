@@ -335,7 +335,6 @@ def refresh_priority_metrics():
 
             try:
 
-                # استخراج بيانات السهم من نتيجة Yahoo
                 if isinstance(raw.columns, pd.MultiIndex):
 
                     level0 = raw.columns.get_level_values(0)
@@ -403,7 +402,6 @@ def refresh_priority_metrics():
 
                 stock_df = stock_df.sort_index()
 
-                # استبعاد شمعة 5 دقائق غير المكتملة
                 candle_close = (
                     stock_df.index + timedelta(minutes=5)
                 )
@@ -440,8 +438,6 @@ def refresh_priority_metrics():
                 ):
                     continue
 
-                # متوسط قيمة التداول بالدولار
-                # السعر × الحجم
                 dollar_volume = close * volume
 
                 avg_dollar_volume = safe_float(
@@ -450,7 +446,6 @@ def refresh_priority_metrics():
                     ).mean()
                 )
 
-                # حجم آخر شمعة مقارنة بمتوسط الشموع السابقة
                 previous_volumes = volume.iloc[
                     -PRIORITY_LOOKBACK_BARS - 1:-1
                 ]
@@ -478,7 +473,6 @@ def refresh_priority_metrics():
                             latest_volume / average_volume
                         )
 
-                # حساب ATR من بيانات 5 دقائق
                 previous_close = close.shift(1)
 
                 tr1 = high - low
@@ -527,8 +521,6 @@ def refresh_priority_metrics():
                     str(e)[:120]
                 )
 
-        # الاحتفاظ بالبيانات السابقة للأسهم التي لم تصل بياناتها
-        # وعدم استبدالها بنتيجة فارغة.
         PRIORITY_METRICS.update(updated_metrics)
 
         priority_updated_at = time_module.time()
@@ -557,12 +549,10 @@ def refresh_priority_metrics():
 def get_priority_batch():
 
     """
-    يختار أفضل 12 سهمًا بترتيب موحّد:
+    يختار أفضل 12 سهمًا بترتيب موحد:
 
-    - 50% لترتيب السيولة (متوسط قيمة التداول بالدولار).
-    - 50% لترتيب نشاط حجم التداول (Volume Ratio).
-
-    لا توجد مجموعات منفصلة أو حصص ثابتة.
+    - 50% لترتيب السيولة.
+    - 50% لترتيب نشاط حجم التداول.
 
     يمنع تكرار السهم لمدة 15 دقيقة.
     وإذا لم يتوفر 12 سهمًا بعد التبريد،
@@ -573,10 +563,6 @@ def get_priority_batch():
 
     if not TICKERS:
         return []
-
-    # -------------------------------------------------
-    # 1. استبعاد الأسهم التي لم تنتهِ مدة التبريد لها
-    # -------------------------------------------------
 
     eligible = []
 
@@ -593,10 +579,6 @@ def get_priority_batch():
 
         if elapsed >= SCAN_REPEAT_COOLDOWN:
             eligible.append(ticker)
-
-    # -------------------------------------------------
-    # 2. استكمال العدد بالأقدم فحصًا عند الحاجة
-    # -------------------------------------------------
 
     if len(eligible) < SCAN_BATCH_SIZE:
 
@@ -621,10 +603,6 @@ def get_priority_batch():
 
     if not eligible:
         return []
-
-    # -------------------------------------------------
-    # 3. تجهيز بيانات السيولة وحجم التداول
-    # -------------------------------------------------
 
     metrics_rows = []
 
@@ -660,10 +638,6 @@ def get_priority_batch():
 
     metrics_df = pd.DataFrame(metrics_rows)
 
-    # -------------------------------------------------
-    # 4. ترتيب السيولة وحجم التداول بشكل نسبي
-    # -------------------------------------------------
-
     metrics_df["liquidity_rank"] = (
         metrics_df["avg_dollar_volume"].rank(
             method="average",
@@ -678,19 +652,11 @@ def get_priority_batch():
         )
     )
 
-    # -------------------------------------------------
-    # 5. الدرجة الموحدة: 50% سيولة + 50% حجم تداول
-    # -------------------------------------------------
-
     metrics_df["combined_score"] = (
         metrics_df["liquidity_rank"] * 0.50
         +
         metrics_df["volume_rank"] * 0.50
     )
-
-    # -------------------------------------------------
-    # 6. كسر التعادل بالسيولة ثم الحجم ثم الأقدم فحصًا
-    # -------------------------------------------------
 
     metrics_df["last_scan"] = (
         metrics_df["ticker"].map(
@@ -944,7 +910,6 @@ def prepare_dataframe(df, interval):
     if df.empty:
         raise ValueError("لا توجد بيانات صالحة")
 
-    # استبعاد الشمعة غير المكتملة للفريمات اللحظية
     minutes = {
         "5m": 5,
         "15m": 15
@@ -960,7 +925,6 @@ def prepare_dataframe(df, interval):
             candle_close <= now_ny() - timedelta(seconds=30)
         ]
 
-    # استبعاد شمعة اليوم غير المكتملة من الفريم اليومي
     if interval == "1d":
 
         today = now_ny().date()
@@ -1013,8 +977,6 @@ def prepare_dataframe(df, interval):
         min_periods=10
     ).mean()
 
-    # ضغط شراء وبيع تقديري من موقع الإغلاق داخل الشمعة والحجم.
-    # لا يمثل بيانات دفتر الأوامر أو تدفق الأوامر الحقيقي.
     candle_range = (
         df["High"] - df["Low"]
     ).replace(0, float("nan"))
@@ -1113,7 +1075,8 @@ def find_resistance_levels(df, entry, atr):
 
     """
     يحدد مستويات المقاومة من القمم المحلية السابقة.
-    لا يستخدم سعرًا ثابتًا بالدولار لتحديد الأهداف.
+    يستخدم ATR للمساعدة في دمج المقاومات المتقاربة.
+    لا يضع أهدافًا ثابتة بالدولار.
     """
 
     if df is None or len(df) < 10:
@@ -1125,7 +1088,6 @@ def find_resistance_levels(df, entry, atr):
 
     candidates = []
 
-    # اكتشاف القمم المحلية
     for i in range(
         PIVOT_LEFT,
         len(highs) - PIVOT_RIGHT
@@ -1149,7 +1111,6 @@ def find_resistance_levels(df, entry, atr):
             if current_high > entry:
                 candidates.append(current_high)
 
-    # إضافة أعلى قمة سابقة قريبة
     previous_bars = recent.iloc[:-1]
 
     if not previous_bars.empty:
@@ -1166,7 +1127,7 @@ def find_resistance_levels(df, entry, atr):
 
     candidates = sorted(candidates)
 
-    # دمج المقاومات المتقاربة
+    # ATR مساعد لدمج المقاومات المتقاربة
     tolerance = max(
         atr * 0.35,
         entry * 0.002
@@ -1212,7 +1173,7 @@ def calculate_trade_levels(entry, atr, df):
 
     entry = round(entry, 2)
 
-    # وقف الخسارة بحسب تذبذب السهم
+    # وقف الخسارة بحسب تذبذب السهم باستخدام ATR
     stop_distance = max(
         atr * ATR_STOP_MULTIPLIER,
         entry * 0.01
@@ -1238,58 +1199,36 @@ def calculate_trade_levels(entry, atr, df):
     if stop_percent > MAX_STOP_PERCENT:
         return None
 
-    # المقاومات الفنية الخاصة بالسهم
+    # استخراج المقاومات الفنية الفعلية
     resistance_levels = find_resistance_levels(
         df,
         entry,
         atr
     )
 
-    # أقل مسافة مطلوبة لتحقيق 1:2
+    # الحد الأدنى للعائد للمخاطرة يبقى كما هو
     minimum_target1 = ceil_cent(
         entry + risk * MIN_RISK_REWARD
     )
 
-    # أقل مسافة مطلوبة لتحقيق 1:3
     minimum_target2 = ceil_cent(
         entry + risk * TARGET2_MIN_RISK_REWARD
     )
 
-    # الهدف الأول:
-    # أقرب مقاومة تحقق 1:2 على الأقل
+    # الهدف الأول: أقرب مقاومة تحقق شرط العائد للمخاطرة
     target1_candidates = [
         level
         for level in resistance_levels
         if level >= minimum_target1
     ]
 
-    if target1_candidates:
-
-        target1 = min(target1_candidates)
-
-        target1_source = "مقاومة فنية"
-
-    else:
-
-        target1 = ceil_cent(
-            max(
-                minimum_target1,
-                entry + atr * 2
-            )
-        )
-
-        target1_source = "إسقاط ATR"
-
-    rr1 = (
-        target1 - entry
-    ) / risk
-
-    if rr1 < MIN_RISK_REWARD:
+    if not target1_candidates:
         return None
 
-    # الهدف الثاني:
-    # المقاومة التالية بعد الهدف الأول،
-    # بشرط أن تحقق 1:3 على الأقل.
+    target1 = min(target1_candidates)
+
+    # الهدف الثاني: المقاومة التالية بعد الهدف الأول
+    # بشرط تحقيق الحد الأدنى للعائد للمخاطرة
     target2_candidates = [
         level
         for level in resistance_levels
@@ -1299,30 +1238,24 @@ def calculate_trade_levels(entry, atr, df):
         )
     ]
 
-    if target2_candidates:
+    if not target2_candidates:
+        return None
 
-        target2 = min(target2_candidates)
-
-        target2_source = "المقاومة الفنية التالية"
-
-    else:
-
-        target2 = ceil_cent(
-            max(
-                minimum_target2,
-                target1 + atr,
-                entry + atr * 3
-            )
-        )
-
-        target2_source = "إسقاط ATR"
+    target2 = min(target2_candidates)
 
     if target2 <= target1:
         return None
 
+    rr1 = (
+        target1 - entry
+    ) / risk
+
     rr2 = (
         target2 - entry
     ) / risk
+
+    if rr1 < MIN_RISK_REWARD:
+        return None
 
     if rr2 < TARGET2_MIN_RISK_REWARD:
         return None
@@ -1339,15 +1272,30 @@ def calculate_trade_levels(entry, atr, df):
         "risk_reward": round(rr1, 2),
         "target2_risk_reward": round(rr2, 2),
 
-        "target1_source": target1_source,
-        "target2_source": target2_source,
+        "target1_source": "المقاومة الفنية الأولى",
+        "target2_source": "المقاومة الفنية الثانية",
 
         "resistance_levels": resistance_levels
     }
 
 
 # =====================================================
-# 12. تحليل استراتيجية واحدة لكل سهم
+# 12. تحديد مدة الفرصة حسب نوعها
+# =====================================================
+
+def get_opportunity_duration(style):
+
+    durations = {
+        "سكالبينج": "دقائق",
+        "تداول يومي": "ساعات",
+        "سوينغ": "يوم إلى يومين"
+    }
+
+    return durations.get(style, "غير محددة")
+
+
+# =====================================================
+# 13. تحليل استراتيجية واحدة لكل سهم
 # =====================================================
 
 def evaluate_strategy(ticker, df, style, vwap=None):
@@ -1391,7 +1339,6 @@ def evaluate_strategy(ticker, df, style, vwap=None):
     if buy_pressure is None or sell_pressure is None:
         return None
 
-    # اتجاه السهم نفسه فقط
     bullish_setup = (
         (entry > ema20 and ema20 >= ema50)
         or (
@@ -1407,7 +1354,6 @@ def evaluate_strategy(ticker, df, style, vwap=None):
     score = 0
     reasons = []
 
-    # الاتجاه الفني: نقطتان
     if entry > ema20:
         score += 1
         reasons.append("السعر فوق EMA20")
@@ -1416,7 +1362,6 @@ def evaluate_strategy(ticker, df, style, vwap=None):
         score += 1
         reasons.append("EMA20 فوق EMA50")
 
-    # تأكيد الاتجاه: نقطة واحدة
     if style in ("سكالبينج", "تداول يومي"):
 
         if vwap is not None and entry > vwap:
@@ -1429,7 +1374,6 @@ def evaluate_strategy(ticker, df, style, vwap=None):
             score += 1
             reasons.append("ميل EMA50 صاعد")
 
-    # حجم التداول: نقطتان
     if volume_ratio >= 1.5:
 
         score += 2
@@ -1440,13 +1384,11 @@ def evaluate_strategy(ticker, df, style, vwap=None):
         score += 1
         reasons.append("حجم تداول مقبول")
 
-    # RSI: نقطة
     if 48 <= rsi <= 68:
 
         score += 1
         reasons.append("RSI ضمن النطاق الإيجابي")
 
-    # ضغط الشراء: نقطتان
     if buy_pressure >= 65:
 
         score += 2
@@ -1457,7 +1399,6 @@ def evaluate_strategy(ticker, df, style, vwap=None):
         score += 1
         reasons.append("ضغط شراء تقديري إيجابي")
 
-    # الدعم والمقاومة
     previous_bars = df.iloc[-21:-1]
 
     support = safe_float(
@@ -1515,7 +1456,7 @@ def evaluate_strategy(ticker, df, style, vwap=None):
     if score < MIN_SCORE:
         return None
 
-    # حساب الأهداف الفنية من بيانات السهم نفسه
+    # حساب وقف الخسارة والهدفين من مستويات السهم الفنية
     levels = calculate_trade_levels(
         entry,
         atr,
@@ -1528,6 +1469,7 @@ def evaluate_strategy(ticker, df, style, vwap=None):
     return {
         "ticker": ticker,
         "style": style,
+        "duration": get_opportunity_duration(style),
         "score": score,
 
         "entry": levels["entry"],
@@ -1563,7 +1505,7 @@ def evaluate_strategy(ticker, df, style, vwap=None):
 
 
 # =====================================================
-# 13. تحليل السهم بالاستراتيجيات الثلاث
+# 14. تحليل السهم بالاستراتيجيات الثلاث
 # =====================================================
 
 def analyze_ticker(ticker):
@@ -1663,57 +1605,36 @@ def analyze_ticker(ticker):
 
 
 # =====================================================
-# 14. رسالة الفرصة
+# 15. رسالة الفرصة المختصرة
 # =====================================================
 
 def trade_message(trade):
-
-    profit1 = trade["target1"] - trade["entry"]
-    profit2 = trade["target2"] - trade["entry"]
-
-    resistance_text = (
-        ", ".join(
-            f"${level:.2f}"
-            for level in trade["resistance_levels"][:5]
-        )
-        if trade["resistance_levels"]
-        else "لم تُرصد مقاومات واضحة"
-    )
 
     return (
         "🚀 فرصة شراء أسهم أمريكية\n\n"
 
         f"📌 السهم: {trade['ticker']}\n"
-        f"💵 سعر السهم: ${trade['entry']:.2f}\n"
-        f"📊 نوع الصفقة: {trade['style']}\n"
+        f"💵 السعر: ${trade['entry']:.2f}\n"
+        f"📊 نوع الفرصة: {trade['style']}\n"
+        f"⏱️ مدة الفرصة: {trade['duration']}\n"
         f"⭐ قوة الإشارة: {trade['score']}/10\n\n"
 
         "📍 خطة الصفقة\n"
 
-        f"🟢 سعر الدخول: ${trade['entry']:.2f}\n"
-        f"🛑 وقف الخسارة: ${trade['stop']:.2f}\n\n"
-
+        f"🟢 الدخول: ${trade['entry']:.2f}\n"
+        f"🛑 وقف الخسارة: ${trade['stop']:.2f}\n"
         f"🎯 الهدف الأول: ${trade['target1']:.2f}\n"
-        f"مصدر الهدف الأول: {trade['target1_source']}\n"
-        f"الربح النظري: ${profit1:.2f} للسهم\n"
-        f"العائد للمخاطرة: 1:{trade['risk_reward']:.2f}\n\n"
-
-        f"🎯 الهدف الثاني: ${trade['target2']:.2f}\n"
-        f"مصدر الهدف الثاني: {trade['target2_source']}\n"
-        f"الربح النظري: ${profit2:.2f} للسهم\n"
-        f"العائد للمخاطرة: 1:{trade['target2_risk_reward']:.2f}\n\n"
+        f"🎯 الهدف الثاني: ${trade['target2']:.2f}\n\n"
 
         "📈 المؤشرات\n"
 
-        f"ضغط الشراء التقديري: {trade['buy_pressure']:.1f}%\n"
-        f"ضغط البيع التقديري: {trade['sell_pressure']:.1f}%\n"
         f"RSI: {trade['rsi']}\n"
         f"حجم التداول: {trade['volume_ratio']}x\n"
+        f"ضغط الشراء: {trade['buy_pressure']:.1f}%\n"
+        f"ضغط البيع: {trade['sell_pressure']:.1f}%\n"
         f"ATR: {trade['atr']}\n\n"
 
-        f"📌 المقاومات المرصودة:\n{resistance_text}\n\n"
-
-        "🔍 أسباب الترشيح:\n"
+        "🔍 سبب الترشيح:\n"
 
         + "\n".join(
             f"• {reason}"
@@ -1725,11 +1646,9 @@ def trade_message(trade):
         f"🕒 وقت التحليل: "
         f"{trade['timestamp'].strftime('%H:%M:%S')} السعودية\n\n"
 
-        "⚠️ الأهداف تقديرات فنية مبنية على المقاومات "
-        "وتذبذب السهم، وليست ضمانًا للوصول إليها. "
-        "قد تتغير مستويات الدعم والمقاومة مع حركة السعر. "
-        "ضغط الشراء تقديري من بيانات الشموع والحجم، "
-        "وليس قراءة مباشرة لتدفق الأوامر.\n\n"
+        "⚠️ الأهداف مبنية على المقاومات الفنية، "
+        "وATR عامل مساعد في تقدير التذبذب. "
+        "الأسعار والمدة تقديرات تحليلية وليست ضمانًا للوصول إليها.\n\n"
 
         "تحقق من السعر قبل الشراء؛ إذا ابتعد السعر "
         "عن الدخول بأكثر من 0.3% فلا تطارد السهم."
@@ -1737,7 +1656,7 @@ def trade_message(trade):
 
 
 # =====================================================
-# 15. إرسال الرسائل
+# 16. إرسال الرسائل
 # =====================================================
 
 async def send_to_subscribers(application, message):
@@ -1774,7 +1693,7 @@ async def send_to_subscribers(application, message):
 
 
 # =====================================================
-# 16. فتح صفقة
+# 17. فتح صفقة
 # =====================================================
 
 async def open_trade(application, opportunity):
@@ -1830,7 +1749,7 @@ async def open_trade(application, opportunity):
 
 
 # =====================================================
-# 17. السعر الحالي
+# 18. السعر الحالي
 # =====================================================
 
 def get_current_price(ticker):
@@ -1911,7 +1830,7 @@ def get_current_price(ticker):
 
 
 # =====================================================
-# 18. متابعة الصفقات
+# 19. متابعة الصفقات
 # =====================================================
 
 async def monitor_trades(application):
@@ -2061,7 +1980,7 @@ async def monitor_loop(application):
 
 
 # =====================================================
-# 19. محرك الفحص
+# 20. محرك الفحص
 # =====================================================
 
 async def run_scan(application, manual=False):
@@ -2077,7 +1996,6 @@ async def run_scan(application, manual=False):
 
     async with scan_lock:
 
-        # التحقق من الوقت أولًا
         if not market_is_open_for_scanning():
 
             return (
@@ -2100,12 +2018,10 @@ async def run_scan(application, manual=False):
         summary = {}
         errors = []
 
-        # تحديث بيانات الأولويات قبل اختيار الدفعة
         await asyncio.to_thread(
             refresh_priority_metrics
         )
 
-        # اختيار أفضل 12 سهمًا حسب الترتيب الموحد للسيولة وحجم التداول
         batch = get_priority_batch()
 
         logger.info(
@@ -2120,7 +2036,6 @@ async def run_scan(application, manual=False):
             if daily_count >= MAX_PER_DAY:
                 break
 
-            # تسجيل وقت فحص السهم لمنع تكراره في دفعات متقاربة
             LAST_TICKER_SCAN[ticker] = time_module.time()
 
             if ticker in sent_today:
@@ -2234,10 +2149,10 @@ async def run_scan(application, manual=False):
         report = (
             "📊 انتهى فحص الدفعة\n\n"
             "طريقة التحليل: كل سهم مستقل.\n"
-            "ترتيب الأسهم: أفضل 12 حسب السيولة وحجم التداول بترتيب موحّد.\n"
+            "ترتيب الأسهم: أفضل 12 حسب السيولة وحجم التداول بترتيب موحد.\n"
             "التحديث: كل 3 دقائق.\n"
             "منع التكرار: 15 دقيقة، مع استكمال العدد بالأقدم فحصًا عند الحاجة.\n"
-            "الأهداف: مقاومات فنية وإسقاط ATR عند الحاجة.\n"
+            "الأهداف: المقاومة الفنية الأولى والثانية، وATR مساعد.\n"
             f"الفرص المرسلة: {daily_count}/{MAX_PER_DAY}\n"
             f"الأسهم في هذه الدفعة: {len(summary)}\n"
             f"إجمالي الأسهم في القائمة: {len(TICKERS)}\n"
@@ -2252,7 +2167,7 @@ async def run_scan(application, manual=False):
 
 
 # =====================================================
-# 20. الفحص التلقائي
+# 21. الفحص التلقائي
 # =====================================================
 
 async def scanner_loop(application):
@@ -2285,7 +2200,7 @@ async def scanner_loop(application):
 
 
 # =====================================================
-# 21. أوامر تيليجرام
+# 22. أوامر تيليجرام
 # =====================================================
 
 async def start_command(update, context):
@@ -2299,7 +2214,7 @@ async def start_command(update, context):
 
         "البوت يبحث عن الأسهم الأمريكية بين 10 و100 دولار.\n\n"
 
-        "أنواع الصفقات:\n"
+        "أنواع الفرص:\n"
         "⚡ سكالبينج\n"
         "📊 تداول يومي\n"
         "📈 سوينغ\n\n"
@@ -2308,11 +2223,12 @@ async def start_command(update, context):
         "سعر الدخول\n"
         "وقف الخسارة\n"
         "الهدف الأول والثاني من المقاومات الفنية\n"
+        "مدة الفرصة\n"
         "قوة الإشارة\n"
         "العائد للمخاطرة\n\n"
 
-        "الأهداف تعتمد على المقاومات وتذبذب السهم، "
-        "ولا توجد مبالغ ربح ثابتة.\n\n"
+        "الأهداف حسب المقاومات الفنية، "
+        "وATR عامل مساعد، ولا توجد مبالغ ربح ثابتة.\n\n"
 
         "كل سهم يُحلل بصورة مستقلة.\n\n"
 
@@ -2373,8 +2289,8 @@ async def status_command(update, context):
         f"العائد للمخاطرة للهدف الأول: 1:{MIN_RISK_REWARD:.1f} على الأقل\n"
         f"العائد للمخاطرة للهدف الثاني: 1:{TARGET2_MIN_RISK_REWARD:.1f} على الأقل\n\n"
 
-        "🎯 الأهداف: مقاومات السهم الفنية، "
-        "وإسقاط ATR عند عدم وجود مقاومة مناسبة.\n"
+        "🎯 الأهداف: المقاومة الفنية الأولى والثانية، "
+        "وATR عامل مساعد في حساب الوقف وتقييم التذبذب.\n"
         "لا توجد أهداف ربح ثابتة بالدولار.\n\n"
 
         f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}\n"
@@ -2387,7 +2303,7 @@ async def status_command(update, context):
         f"متابعة الصفقات كل: {MONITOR_INTERVAL} ثانية\n\n"
 
         "أولوية الفحص:\n"
-        "أفضل 12 سهمًا بترتيب موحّد يجمع السيولة وحجم التداول، "
+        "أفضل 12 سهمًا بترتيب موحد يجمع السيولة وحجم التداول، "
         "بنسبة 50% لكل منهما.\n"
         f"منع تكرار السهم لمدة: {SCAN_REPEAT_COOLDOWN // 60} دقيقة.\n"
         "عند عدم توفر 12 سهمًا بعد التبريد، يُستكمل العدد بالأقدم فحصًا.\n\n"
@@ -2414,11 +2330,11 @@ async def report_command(update, context):
         "📋 تقرير آخر فحص",
         f"الوقت السعودي: {last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}",
         "طريقة التحليل: كل سهم مستقل.",
-        "ترتيب الأسهم: أفضل 12 حسب السيولة وحجم التداول بترتيب موحّد.",
+        "ترتيب الأسهم: أفضل 12 حسب السيولة وحجم التداول بترتيب موحد.",
         "وزن السيولة: 50%، ووزن حجم التداول: 50%.",
         "التحديث: كل 3 دقائق.",
         "منع التكرار: 15 دقيقة، والاستكمال بالأقدم فحصًا عند الحاجة.",
-        "الأهداف: مقاومات فنية وإسقاط ATR عند الحاجة.",
+        "الأهداف: المقاومة الفنية الأولى والثانية، وATR عامل مساعد.",
         f"الفرص المرسلة اليوم: {daily_count}/{MAX_PER_DAY}",
         f"عدد الأسهم في القائمة: {len(TICKERS)}",
         ""
@@ -2462,7 +2378,7 @@ async def debug_command(update, context):
         f"العائد الأدنى للهدف الأول: 1:{MIN_RISK_REWARD}",
         f"العائد الأدنى للهدف الثاني: 1:{TARGET2_MIN_RISK_REWARD}",
 
-        "الأهداف: مقاومات فنية وإسقاط ATR عند الحاجة.",
+        "الأهداف: المقاومتان الفنيتان الأولى والثانية، وATR عامل مساعد.",
 
         "الاستراتيجيات: سكالبينج، يومي، سوينغ",
 
@@ -2504,11 +2420,10 @@ async def active_command(update, context):
         lines.append(
             f"\n📈 {ticker}\n"
             f"النوع: {trade['style']}\n"
+            f"مدة الفرصة: {trade['duration']}\n"
             f"الدخول: ${trade['entry']:.2f}\n"
             f"الهدف الأول: ${trade['target1']:.2f}\n"
-            f"مصدر الهدف الأول: {trade['target1_source']}\n"
             f"الهدف الثاني: ${trade['target2']:.2f}\n"
-            f"مصدر الهدف الثاني: {trade['target2_source']}\n"
             f"وقف الخسارة: ${trade['stop']:.2f}\n"
             f"التقييم: {trade['score']}/10\n"
             f"العائد للمخاطرة للهدف الأول: 1:{trade['risk_reward']:.2f}\n"
@@ -2535,7 +2450,7 @@ async def help_command(update, context):
 
 
 # =====================================================
-# 22. بدء المهام
+# 23. بدء المهام
 # =====================================================
 
 async def post_init(application):
@@ -2554,7 +2469,7 @@ async def post_init(application):
 
 
 # =====================================================
-# 23. خادم Render
+# 24. خادم Render
 # =====================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -2610,7 +2525,7 @@ def start_health_server():
 
 
 # =====================================================
-# 24. تشغيل البوت
+# 25. تشغيل البوت
 # =====================================================
 
 def main():
