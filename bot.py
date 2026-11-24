@@ -1,4 +1,6 @@
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
@@ -12,6 +14,19 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 # وقت العمل بتوقيت السعودية: من 5 عصراً الى 12 منتصف الليل
 SAUDI_TZ = pytz.timezone("Asia/Riyadh")
+
+# ========== سيرفر وهمي عشان Render المجاني ما يطفي البوت ==========
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    def log_message(self, *args):
+        pass
+
+def run_web_server():
+    port = int(os.getenv("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 # ========== قائمة الشركات - 40 شركة الأكثر حركة يومية - تحت 300$ ==========
 WATCHLIST = [
@@ -182,4 +197,5 @@ async def main_loop():
             await asyncio.sleep(300)
 
 if __name__ == "__main__":
+    threading.Thread(target=run_web_server, daemon=True).start()
     asyncio.run(main_loop())
