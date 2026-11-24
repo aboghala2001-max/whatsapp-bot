@@ -9,14 +9,10 @@ import asyncio
 import urllib.request
 import urllib.parse
 
-# ========== الاعدادات العامة ==========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-# وقت العمل بتوقيت السعودية: من 5 عصراً الى 12 منتصف الليل
 SAUDI_TZ = pytz.timezone("Asia/Riyadh")
 
-# ========== سيرفر وهمي عشان Render المجاني ما يطفي البوت ==========
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -29,15 +25,10 @@ def run_web_server():
     port = int(os.getenv("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# ========== ارسال تيليجرام مباشر - بدون مكتبة - ما يعلق ابداً ==========
 def send_msg(text):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }).encode()
+        data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(url, data=data)
         with urllib.request.urlopen(req, timeout=10) as resp:
             print(f"Sent OK: {resp.status}")
@@ -46,15 +37,7 @@ def send_msg(text):
         print(f"Send FAILED: {e}")
         return False
 
-# ========== قائمة الشركات - 40 شركة الأكثر حركة يومية - تحت 300$ ==========
-WATCHLIST = [
-    "PLTR", "AMD", "MU", "HOOD", "SOFI", "INTC", "SNAP", "U",
-    "DKNG", "AFRM", "UPST", "OPEN", "RBLX", "SHOP", "SQ", "PYPL",
-    "TSLA", "RIVN", "LCID", "NIO", "QS", "CHPT",
-    "COIN", "MARA", "RIOT", "CLSK", "HUT", "BITF",
-    "CCL", "AAL", "UAL", "DAL", "NCLH",
-    "ET", "F", "BAC", "WBD", "PARA", "CPNG", "NU"
-]
+WATCHLIST = ["PLTR", "AMD", "MU", "HOOD", "SOFI", "INTC", "SNAP", "U", "DKNG", "AFRM", "UPST", "OPEN", "RBLX", "SHOP", "SQ", "PYPL", "TSLA", "RIVN", "LCID", "NIO", "QS", "CHPT", "COIN", "MARA", "RIOT", "CLSK", "HUT", "BITF", "CCL", "AAL", "UAL", "DAL", "NCLH", "ET", "F", "BAC", "WBD", "PARA", "CPNG", "NU"]
 
 MAX_ALERTS = {"strong": 3, "medium": 3, "bounce": 3}
 last_sent = {}
@@ -119,13 +102,59 @@ def check_stock(ticker):
     day_change = ((last_close - open_today) / open_today) * 100
     if day_change > 8:
         return None
-
-    # 1. فرصة قوية
-    if (liquidity > 50_000_000 and vol_ratio > 2.0 and
-        price > ema20_1h and price > ema50_1h and
-        50 <= rsi_1h <= 65 and last_close > prev_high_1d):
+    if (liquidity > 50000000 and vol_ratio > 2.0 and price > ema20_1h and price > ema50_1h and 50 <= rsi_1h <= 65 and last_close > prev_high_1d):
         target = price * 1.10
         stop = price * 0.95
-        return ("strong", f"🔥 <b>فرصة قوية - {ticker}</b>\n"
-                f"السعر: {price:.2f}$ | السيولة: {liquidity/1e6:.0f}M | الحجم: {vol_ratio:.1f}x\n"
-                f"RSI: {rsi_1
+        msg = "🔥 فرصة قوية - " + ticker + " | السعر: " + str(round(price,2)) + "$ | السيولة: " + str(round(liquidity/1000000)) + "M | RSI: " + str(round(rsi_1h)) + " | الهدف: " + str(round(target,2)) + "$ | الوقف: " + str(round(stop,2)) + "$"
+        return ("strong", msg)
+    if (10000000 <= liquidity <= 50000000 and vol_ratio > 1.3 and price > ema20_1h and 45 <= rsi_1h <= 68 and last_close >= prev_high_1d * 0.99):
+        target = price * 1.06
+        stop = price * 0.963
+        msg = "⚡ فرصة متوسطة - " + ticker + " | السعر: " + str(round(price,2)) + "$ | السيولة: " + str(round(liquidity/1000000)) + "M | RSI: " + str(round(rsi_1h)) + " | الهدف: " + str(round(target,2)) + "$ | الوقف: " + str(round(stop,2)) + "$"
+        return ("medium", msg)
+    near_support = abs(price - ema50_1d) / ema50_1d < 0.01 or abs(price - ema200_1d) / ema200_1d < 0.01
+    low_20 = float(df_1d["Low"].tail(20).min())
+    near_low = abs(price - low_20) / low_20 < 0.015
+    is_green_after_support = last_close > last_open
+    has_long_tail = (last_close - last_low) > (last_close - last_open) * 1.5 if (last_close - last_open) != 0 else False
+    if (liquidity > 20000000 and vol_ratio > 1.5 and (near_support or near_low) and 30 <= rsi_1h <= 45 and (is_green_after_support or has_long_tail)):
+        support = ema50_1d if abs(price - ema50_1d) < abs(price - ema200_1d) else ema200_1d
+        if near_low and not near_support:
+            support = low_20
+        target = price * 1.053
+        stop = price * 0.98
+        msg = "🛡️ فرصة ارتداد - " + ticker + " | السعر: " + str(round(price,2)) + "$ | الدعم: " + str(round(support,2)) + "$ | RSI: " + str(round(rsi_1h)) + " | الهدف: " + str(round(target,2)) + "$ | الوقف: " + str(round(stop,2)) + "$"
+        return ("bounce", msg)
+    return None
+
+async def main_loop():
+    while True:
+        reset_daily()
+        if is_work_time():
+            for ticker in WATCHLIST:
+                if ticker in last_sent:
+                    minutes_passed = (datetime.now(SAUDI_TZ) - last_sent[ticker]).total_seconds() / 60
+                    if minutes_passed < 60:
+                        continue
+                result = check_stock(ticker)
+                if result:
+                    kind, msg = result
+                    if alerts_count[kind] < MAX_ALERTS[kind]:
+                        send_msg(msg)
+                        alerts_count[kind] += 1
+                        last_sent[ticker] = datetime.now(SAUDI_TZ)
+                        print(f"Sent {kind} {ticker}")
+                await asyncio.sleep(1)
+            print("انتهت الجولة، انتظار 5 دقايق...")
+            await asyncio.sleep(300)
+        else:
+            print("خارج وقت العمل 5م - 12ص، انتظار...")
+            await asyncio.sleep(300)
+
+async def test_start():
+    send_msg("✅ البوت اشتغل واتصل فيك بنجاح")
+    await main_loop()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web_server, daemon=True).start()
+    asyncio.run(test_start())
