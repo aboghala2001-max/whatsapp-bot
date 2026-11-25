@@ -1,63 +1,171 @@
-import os, time, requests, threading
-from datetime import datetime, date, time as dtime
-import zoneinfo
+import os
+import time
+import requests
+import threading
+from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN", "")
-MARKETDATA_TOKEN = os.getenv("MARKETDATA_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-RIYADH = zoneinfo.ZoneInfo("Asia/Riyadh")
+FINNHUB_API_KEY = os.getenv("MARKETDATA_TOKEN", "")
+LAST_CHAT_ID = 0
 
-# 37 سهم - 35 شركة + SPY + QQQ
-UNIVERSE = ["SPY","QQQ","NVDA","AAPL","AMZN","META","GOOGL","TSLA","AMD","AVGO","PLTR","COIN","MSTR","SMCI","ARM","MU","NFLX","MSFT","SOFI","PFE","ET","INTC","BAC","F","UBER","HOOD","MARA","RIOT","CHWY","LCID","RIVN","AFRM","DKNG","PENN","X","CLF","FCX"]
+print("BOT_TOKEN found:", bool(TELEGRAM_TOKEN))
+print("MARKETDATA_TOKEN found:", bool(FINNHUB_API_KEY))
 
-sent_today = {}
-counts = {"strong": 0, "medium": 0, "bounce": 0}
-today_date = date.today()
-
-def reset_daily():
-    global sent_today, counts, today_date
-    if date.today() != today_date:
-        sent_today = {}; counts = {"strong": 0, "medium": 0, "bounce": 0}; today_date = date.today()
+COMPANIES = [
+    "AAPL","NVDA","AMD","INTC","MU","QCOM","CRM","UBER","ABNB","SHOP",
+    "SQ","PYPL","COIN","HOOD","PLTR","SOFI","NIO","RIVN","F","GM",
+    "BAC","C","WFC","XOM","PFE","BA","DAL","UAL","AAL","LUV",
+    "M","BBY","TGT","MRNA","MARA","RIOT","LCID","CVX","AVGO","MSFT"
+]
 
 def send_telegram(chat_id, text):
-    if not TELEGRAM_TOKEN or not chat_id: return
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=10)
-    except: pass
+    if not TELEGRAM_TOKEN or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    except Exception as e:
+        print("send error:", e)
 
 def send_to_me(text):
-    if CHAT_ID: send_telegram(CHAT_ID, text)
+    global LAST_CHAT_ID
+    if LAST_CHAT_ID:
+        send_telegram(LAST_CHAT_ID, text)
+    else:
+        print("No chat yet, skip:", text)
 
-def md_get(path, params={}):
+def get_quote(symbol):
     try:
-        p = {"token": MARKETDATA_TOKEN}; p.update(params)
-        r = requests.get(f"https://api.marketdata.app/v1/{path}", params=p, timeout=15).json()
-        if isinstance(r, list): return r[0] if r else {}
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+        r = requests.get(url, timeout=10).json()
         return r
-    except: return {}
+    except Exception as e:
+        print("price error:", e)
+        return {}
 
-def get_quote(sym):
-    return md_get(f"stocks/quotes/{sym}/")
+def get_candle(symbol):
+    try:
+        now = int(time.time())
+        url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=D&from={now-7*86400}&to={now}&token={FINNHUB_API_KEY}"
+        r = requests.get(url, timeout=10).json()
+        if r.get("s") == "ok" and len(r.get("v", [])) >= 2:
+            return r
+        return {}
+    except:
+        return {}
 
-def get_candles(sym, res="D", count=60):
-    return md_get(f"stocks/candles/{res}/{sym}/", {"count": count})
+def is_market_time():
+    saudi = datetime.now(timezone(timedelta(hours=3)))
+    h = saudi.hour
+    return 17 <= h < 24
 
-def ema(prices, n):
-    if len(prices) < n: return 0
-    k = 2/(n+1); e = prices[0]
-    for p in prices[1:]: e = p*k + e*(1-k)
-    return e
+def scan_market():
+    if not is_market_time():
+        return "⏰ السوق مغلق الان\nالفحص يشتغل من 5 المغرب الى 12 الليل بتوقيت السعودية"
+    
+    strong, medium, rebound = [], [], []
+    
+    for sym in COMPANIES:
+        q = get_quote(sym)
+        price = q.get("c", 0)
+        prev = q.get("pc", 0)
+        if price == 0 or prev == 0:
+            continue
+        if not (50 <= price <= 200):
+            continue
+        
+        change = (price - prev) / prev * 100
+        
+        candle = get_candle(sym)
+        vol_ratio = 1.0
+        liquidity = 0
+        support = 0
+        if candle:
+            vols = candle.get("v", [])
+            lows = candle.get("l", [])
+            if len(vols) >= 2 and vols[-2] > 0:
+                vol_ratio = vols[-1] / vols[-2]
+            if vols:
+                liquidity = price * vols[-1]
+            if lows:
+                # الدعم = اقل سعر في آخر 3 ايام
+                support = min(lows[-3:])
+        
+        if liquidity < 10000000:
+            continue
+        
+        if change >= 3 and vol_ratio >= 1.5:
+            target = round(price * 1.04, 2)
+            stop = round(price * 0.97, 2)
+            strong.append(f"🔥 {sym}\nالسعر: ${price}\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop}")
+        elif change >= 1.5 and vol_ratio >= 1.2:
+            target = round(price * 1.025, 2)
+            stop = round(price * 0.98, 2)
+            medium.append(f"⚡ {sym}\nالسعر: ${price}\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop}")
+        elif support > 0:
+            dist_from_support = (price - support) / support * 100
+            if 0 <= dist_from_support <= 2 and change > 0.3 and vol_ratio >= 1.2:
+                target = round(price * 1.03, 2)
+                stop = round(support * 0.99, 2)
+                rebound.append(f"🔄 {sym}\nالسعر: ${price}\nالدعم: ${round(support,2)} | بعده عن الدعم: {round(dist_from_support,2)}%\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop} (تحت الدعم)")
+        time.sleep(0.3)
+    
+    msg = "📊 فحص السوق الأمريكي (50$ - 200$):\n\n"
+    if strong:
+        msg += "🔥 فرص قوية:\n" + "\n\n".join(strong) + "\n\n"
+    if medium:
+        msg += "⚡ فرص متوسطة:\n" + "\n\n".join(medium) + "\n\n"
+    if rebound:
+        msg += "🔄 فرص ارتداد من الدعم:\n" + "\n\n".join(rebound) + "\n\n"
+    if not strong and not medium and not rebound:
+        msg += "لا توجد فرص قوية الان حسب الحجم والسيولة"
+    return msg
 
-def rsi(prices, period=14):
-    if len(prices) < period+1: return 50
-    gains, losses = 0, 0
-    for i in range(1, period+1):
-        diff = prices[-i] - prices[-i-1]
-        if diff > 0: gains += diff
-        else: losses += -diff
-    rs = gains / (losses if losses else 1)
-    return 100 - (100/(1+rs))
+def poll_telegram():
+    global LAST_CHAT_ID
+    offset = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=20"
+            r = requests.get(url, timeout=30).json()
+            for upd in r.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                chat = msg.get("chat", {}).get("id")
+                text = msg.get("text", "").strip().lower()
+                if chat:
+                    if LAST_CHAT_ID != chat:
+                        LAST_CHAT_ID = chat
+                        print("New chat saved:", chat)
+                    if text == "/start":
+                        send_telegram(chat, "✅ البوت شغال\nارسل /scan عشان تفحص السوق\nارسل /status عشان SPY و QQQ")
+                    elif text == "/status":
+                        spy = get_quote("SPY").get("c", 0)
+                        qqq = get_quote("QQQ").get("c", 0)
+                        send_telegram(chat, f"📊 الأسعار:\nSPY: ${spy}\nQQQ: ${qqq}")
+                    elif text == "/scan":
+                        send_telegram(chat, "🔍 جاري فحص 40 شركة...")
+                        send_telegram(chat, scan_market())
+                    elif text == "/price":
+                        spy = get_quote("SPY").get("c", 0)
+                        qqq = get_quote("QQQ").get("c", 0)
+                        send_telegram(chat, f"📊 الأسعار:\nSPY: ${spy}\nQQQ: ${qqq}")
+        except Exception as e:
+            print("poll error:", e)
+            time.sleep(5)
 
-def classify(sym, q, candles_d, candles_1h):
-    price = q.get("last", 0) or q.get("close", 0) or 0
-    if not price: return None
-    # السعر 5$-200$ للشركات، SP
+def alerts_loop():
+    while True:
+        time.sleep(600)
+        if LAST_CHAT_ID and is_market_time():
+            try:
+                send_to_me("⏰ فحص تلقائي:\n" + scan_market())
+            except Exception as e:
+                print(e)
+
+if __name__ == "__main__":
+    print("Bot started...")
+    threading.Thread(target=poll_telegram, daemon=True).start()
+    threading.Thread(target=alerts_loop, daemon=True).start()
+    while True:
+        time.sleep(60)
