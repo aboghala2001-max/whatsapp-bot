@@ -1,6 +1,7 @@
 import os
 import requests
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import time
 import threading
@@ -8,6 +9,7 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ============ الإعدادات ============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 MY_CHAT_ID = int(os.getenv("MY_CHAT_ID", "0"))
@@ -15,276 +17,345 @@ MY_CHAT_ID = int(os.getenv("MY_CHAT_ID", "0"))
 SAUDI_TZ = ZoneInfo("Asia/Riyadh")
 US_EASTERN = ZoneInfo("America/New_York")
 
+# الشروط العامة
 PRICE_MIN = 5
 PRICE_MAX = 200
+NET_INCOME_MIN = 0
 MAX_GAIN_DAY = 8.0
-MAX_STRONG = 3
-MAX_MEDIUM = 3
-MAX_BOUNCE = 3
-SCAN_MIN = 5
 
-alerts = {"strong": 0, "medium": 0, "bounce": 0}
+# عدد التنبيهات باليوم
+MAX_ALERTS_STRONG = 3
+MAX_ALERTS_MEDIUM = 3
+MAX_ALERTS_BOUNCE = 3
+
+SCAN_INTERVAL_MIN = 5
+
+# ============ الحالة ============
+alerts_count = {"strong": 0, "medium": 0, "bounce": 0}
 last_sent = {}
-active = {}
-last_report = "no scan yet"
-last_debug = "no debug yet"
-last_time = None
+active_trades = {}
+last_scan_report = "لا يوجد فحص بعد"
+last_debug_report = "لا يوجد تشخيص بعد"
+last_scan_time = None
 is_scanning = False
 
-def send_tg(chat_id, text):
+# ============ أدوات ============
+def send_telegram(chat_id, text):
     if not TELEGRAM_TOKEN:
+        print("No Token")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
     except Exception as e:
-        print(e)
+        print(f"Telegram Error: {e}")
 
-def send_me(text):
+def send_to_me(text):
     if MY_CHAT_ID:
-        send_tg(MY_CHAT_ID, text)
+        send_telegram(MY_CHAT_ID, text)
 
-def get_rsi(s, p=14):
-    d = s.diff()
-    g = d.where(d > 0, 0).rolling(p).mean()
-    l = (-d.where(d < 0, 0)).rolling(p).mean()
-    rs = g / l
+def get_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def market_open():
-    now = datetime.now(US_EASTERN)
-    if now.weekday() >= 5:
+def is_market_open():
+    now_et = datetime.now(US_EASTERN)
+    if now_et.weekday() >= 5:
         return False
-    return dtime(9, 30) <= now.time() <= dtime(16, 0)
+    return dtime(9, 30) <= now_et.time() <= dtime(16, 0)
 
-def get_stocks():
+def get_all_us_stocks():
     try:
-        u = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_API_KEY}"
-        r = requests.get(u, timeout=30).json()
-        out = []
-        for x in r:
-            s = x["symbol"]
-            if "." not in s and "-" not in s:
-                out.append(s)
-        return out
+        url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_API_KEY}"
+        r = requests.get(url, timeout=30).json()
+        return [x["symbol"] for x in r if "." not in x["symbol"] and "-" not in x["symbol"]]
     except Exception as e:
-        print(e)
+        print(f"Finnhub Error: {e}")
         return []
 
-def check_stock(t):
+# ============ فحص السهم الواحد ============
+def check_stock(ticker):
     try:
-        tk = yf.Ticker(t)
+        tk = yf.Ticker(ticker)
         info = tk.info
+
         price = info.get("currentPrice") or info.get("regularMarketPrice")
-        if not price:
-            return None, f"{t}: no price"
-        if price < PRICE_MIN or price > PRICE_MAX:
-            return None, f"{t}: price out"
-        cap = info.get("marketCap", 0) or 0
-        if cap < 1000000000:
-            return None, f"{t}: small cap"
-        ni = info.get("netIncomeToCommon")
-        if ni is None or ni <= 0:
-            return None, f"{t}: loss"
-        h1 = tk.history(period="5d", interval="1h")
-        d1 = tk.history(period="3mo", interval="1d")
-        if len(h1) < 20 or len(d1) < 50:
-            return None, f"{t}: no data"
-        last = h1.iloc[-1]
-        prev = d1.iloc[-2]
-        lastd = d1.iloc[-1]
-        chg = (lastd["Close"] - prev["Close"]) / prev["Close"] * 100
-        if chg > MAX_GAIN_DAY:
-            return None, f"{t}: up too much"
-        d1["E20"] = d1["Close"].ewm(span=20).mean()
-        d1["E50"] = d1["Close"].ewm(span=50).mean()
-        d1["E200"] = d1["Close"].ewm(span=200).mean()
-        h1["RSI"] = get_rsi(h1["Close"])
-        e20 = d1["E20"].iloc[-1]
-        e50 = d1["E50"].iloc[-1]
-        e200 = d1["E200"].iloc[-1]
-        if pd.isna(e200):
-            e200 = price
-        rsi = h1["RSI"].iloc[-1]
-        avgv = d1["Volume"].tail(20).mean()
-        curv = lastd["Volume"]
-        vr = curv / avgv if avgv else 0
-        dvol = lastd["Close"] * curv
-        phigh = prev["High"]
-        if cap > 5000000000 and dvol > 50000000 and vr > 2.0:
-            if price > e20 and price > e50 and 50 <= rsi <= 65:
-                if last["Close"] > phigh:
-                    return {"t": t, "k": "strong", "p": price, "tg": price*1.10, "st": price*0.95, "rsi": rsi, "vr": vr, "dv": dvol, "cap": cap, "chg": chg}, "OK"
-        if cap > 1000000000 and 10000000 <= dvol <= 50000000 and vr > 1.3:
-            if price > e20 and 45 <= rsi <= 68:
-                if last["Close"] >= phigh*0.98:
-                    return {"t": t, "k": "medium", "p": price, "tg": price*1.06, "st": price*0.963, "rsi": rsi, "vr": vr, "dv": dvol, "cap": cap, "chg": chg}, "OK"
-        sup = None
-        for lvl in [e50, e200, d1["Low"].tail(60).min()]:
-            low60 = d1["Low"].tail(60)
-            cnt = ((low60 <= lvl*1.01) & (low60 >= lvl*0.99)).sum()
-            if cnt >= 3 or abs(price-lvl)/lvl < 0.01:
-                sup = lvl
+        if not price or not (PRICE_MIN <= price <= PRICE_MAX):
+            return None, f"{ticker}: السعر {price} خارج 5-200"
+
+        market_cap = info.get("marketCap", 0) or 0
+        if market_cap < 1_000_000_000:
+            return None, f"{ticker}: قيمة سوقية صغيرة {market_cap/1e9:.2f}B"
+
+        net_income = info.get("netIncomeToCommon")
+        if net_income is None or net_income <= NET_INCOME_MIN:
+            return None, f"{ticker}: الشركة خسرانة"
+
+        df_1h = tk.history(period="5d", interval="1h")
+        df_1d = tk.history(period="3mo", interval="1d")
+        if len(df_1h) < 20 or len(df_1d) < 50:
+            return None, f"{ticker}: بيانات ناقصة"
+
+        last = df_1h.iloc[-1]
+        prev_day = df_1d.iloc[-2]
+        last_day = df_1d.iloc[-1]
+
+        day_change_pct = ((last_day["Close"] - prev_day["Close"]) / prev_day["Close"]) * 100
+        if day_change_pct > MAX_GAIN_DAY:
+            return None, f"{ticker}: صاعد {day_change_pct:.1f}% اكثر من 8%"
+
+        df_1d["EMA20"] = df_1d["Close"].ewm(span=20).mean()
+        df_1d["EMA50"] = df_1d["Close"].ewm(span=50).mean()
+        df_1d["EMA200"] = df_1d["Close"].ewm(span=200).mean()
+        df_1h["RSI"] = get_rsi(df_1h["Close"])
+
+        ema20 = df_1d["EMA20"].iloc[-1]
+        ema50 = df_1d["EMA50"].iloc[-1]
+        ema200 = df_1d["EMA200"].iloc[-1] if not pd.isna(df_1d["EMA200"].iloc[-1]) else price
+        rsi_1h = df_1h["RSI"].iloc[-1]
+
+        avg_vol_20 = df_1d["Volume"].tail(20).mean()
+        curr_vol = last_day["Volume"]
+        vol_ratio = curr_vol / avg_vol_20 if avg_vol_20 else 0
+        dollar_volume = last_day["Close"] * curr_vol
+        prev_high = prev_day["High"]
+
+        # ===== 1. فرصة قوية - اختراق =====
+        if (market_cap > 5_000_000_000 and dollar_volume > 50_000_000 and vol_ratio > 2.0
+            and price > ema20 and price > ema50
+            and 50 <= rsi_1h <= 65
+            and last["Close"] > prev_high):
+            return {
+                "ticker": ticker, "kind": "strong", "price": price,
+                "target": price * 1.10, "stop": price * 0.95,
+                "rsi": rsi_1h, "vol_ratio": vol_ratio, "dollar_vol": dollar_volume,
+                "market_cap": market_cap, "day_change": day_change_pct
+            }, "OK"
+
+        # ===== 2. فرصة متوسطة - اختراق هادي =====
+        if (market_cap > 1_000_000_000 and 10_000_000 <= dollar_volume <= 50_000_000
+            and vol_ratio > 1.3
+            and price > ema20
+            and 45 <= rsi_1h <= 68
+            and last["Close"] >= prev_high * 0.98):
+            return {
+                "ticker": ticker, "kind": "medium", "price": price,
+                "target": price * 1.06, "stop": price * 0.963,
+                "rsi": rsi_1h, "vol_ratio": vol_ratio, "dollar_vol": dollar_volume,
+                "market_cap": market_cap, "day_change": day_change_pct
+            }, "OK"
+
+        # ===== 3. فرصة ارتداد - من الدعم =====
+        support = None
+        for level in [ema50, ema200, df_1d["Low"].tail(60).min()]:
+            touches = ((df_1d["Low"].tail(60) <= level * 1.01) & (df_1d["Low"].tail(60) >= level * 0.99)).sum()
+            if touches >= 3 or abs(price - level) / level < 0.01:
+                support = level
                 break
-        at_sup = False
-        if sup is not None:
-            if abs(price-sup)/sup < 0.015:
-                at_sup = True
-        green = last["Close"] > last["Open"]
-        rng = last["High"] - last["Low"]
-        tail = False
-        if rng > 0:
-            if (min(last["Open"], last["Close"]) - last["Low"]) > rng*0.4:
-                tail = True
-        if cap > 1000000000 and dvol > 20000000 and vr > 1.5:
-            if at_sup and 30 <= rsi <= 45 and (green or tail):
-                return {"t": t, "k": "bounce", "p": price, "tg": price*1.053, "st": price*0.98, "rsi": rsi, "vr": vr, "dv": dvol, "cap": cap, "chg": chg}, "OK"
-        return None, f"{t}: no match"
+
+        is_at_support = support is not None and abs(price - support) / support < 0.015
+        is_green = last["Close"] > last["Open"]
+        has_tail = (min(last["Open"], last["Close"]) - last["Low"]) > (last["High"] - last["Low"]) * 0.4 if (last["High"] - last["Low"]) > 0 else False
+
+        if (market_cap > 1_000_000_000 and dollar_volume > 20_000_000
+            and vol_ratio > 1.5
+            and is_at_support
+            and 30 <= rsi_1h <= 45
+            and (is_green or has_tail)):
+            return {
+                "ticker": ticker, "kind": "bounce", "price": price,
+                "target": price * 1.053, "stop": price * 0.98,
+                "rsi": rsi_1h, "vol_ratio": vol_ratio, "dollar_vol": dollar_volume,
+                "market_cap": market_cap, "day_change": day_change_pct,
+                "support": support
+            }, "OK"
+
+        return None, f"{ticker}: لا تنطبق شروط | RSI {rsi_1h:.0f} | Vol x{vol_ratio:.1f} | $Vol {dollar_volume/1e6:.0f}M | Price {price:.2f} | MC {market_cap/1e9:.1f}B"
+
     except Exception as e:
-        return None, f"{t}: err {e}"
+        return None, f"{ticker}: خطأ {e}"
 
-def fmt(tr):
-    k = tr["k"]
-    if k == "strong":
-        title = "STRONG"
-        act = "big amount"
-        risk = "high"
-    elif k == "medium":
-        title = "MEDIUM"
-        act = "medium amount, check chart"
-        risk = "medium"
+def add_active(trade):
+    active_trades[trade["ticker"]] = {**trade, "entry_time": datetime.now(SAUDI_TZ), "entry_price": trade["price"]}
+
+# ============ تنسيق رسالة الفرصة ============
+def format_message(trade):
+    kind = trade["kind"]
+    if kind == "strong":
+        title = "🔥 فرصة قوية - اختراق"
+        action = "تدخل بمبلغ كبير، بدون ما تشوف الشارت"
+        risk = "عالية"
+    elif kind == "medium":
+        title = "⚡ فرصة متوسطة - اختراق هادي"
+        action = "مبلغ متوسط، لازم تشوف الشارت وتتأكد من الدعم"
+        risk = "متوسطة"
     else:
-        title = "BOUNCE"
-        act = "medium amount, check support"
-        risk = "low"
-    pct_t = (tr["tg"]/tr["p"]-1)*100
-    pct_s = (tr["st"]/tr["p"]-1)*100
-    return f"{title} {tr['t']}\nEntry: {tr['p']:.2f}\nTarget: {tr['tg']:.2f} (+{pct_t:.1f}%)\nStop: {tr['st']:.2f} ({pct_s:.1f}%)\nRSI: {tr['rsi']:.0f} Vol: x{tr['vr']:.1f} Liq: {tr['dv']/1e6:.0f}M Cap: {tr['cap']/1e9:.1f}B Day: {tr['chg']:.1f}% Risk: {risk}\n{act}"
+        title = "🛡️ فرصة ارتداد - من الدعم"
+        action = "مبلغ متوسط، تأكد ان الدعم ما انكسر"
+        risk = "منخفضة"
 
-def check_active():
+    return f"""
+{title}
+<b>{trade['ticker']}</b>
+
+💰 الدخول: {trade['price']:.2f}$
+🎯 الهدف: {trade['target']:.2f}$ (+{((trade['target']/trade['price']-1)*100):.1f}%)
+🛑 الوقف: {trade['stop']:.2f}$ ({((trade['stop']/trade['price']-1)*100):.1f}%)
+
+📊 RSI (1H): {trade['rsi']:.0f}
+📈 الحجم: x{trade['vol_ratio']:.1f}
+💵 السيولة: {trade['dollar_vol']/1e6:.0f}M
+🏢 القيمة السوقية: {trade['market_cap']/1e9:.1f}B
+📅 صعود اليوم: {trade['day_change']:.1f}%
+⚠️ المخاطرة: {risk}
+
+👉 {action}
+"""
+
+# ============ متابعة الهدف والوقف - كل دقيقة ============
+def check_active_trades():
     while True:
         try:
-            if market_open() and active:
-                for t in list(active.keys()):
-                    tr = active[t]
+            if is_market_open() and active_trades:
+                for ticker in list(active_trades.keys()):
+                    tr = active_trades[ticker]
                     try:
-                        cur = yf.Ticker(t).history(period="1d", interval="1m").iloc[-1]["Close"]
-                        pnl = (cur/tr["p"]-1)*100
-                        if cur >= tr["tg"]:
-                            send_me(f"TARGET HIT {t} Entry {tr['p']:.2f} Now {cur:.2f} {pnl:+.1f}%")
-                            del active[t]
-                        elif cur <= tr["st"]:
-                            send_me(f"STOP HIT {t} Entry {tr['p']:.2f} Now {cur:.2f} {pnl:+.1f}%")
-                            del active[t]
+                        curr = yf.Ticker(ticker).history(period="1d", interval="1m").iloc[-1]["Close"]
+                        pnl = ((curr / tr['entry_price'] - 1) * 100)
+                        if curr >= tr['target']:
+                            send_to_me(f"✅ وصل الهدف - <b>{ticker}</b>\n\nدخول: {tr['entry_price']:.2f}$ | الآن: {curr:.2f}$ | {pnl:+.1f}%\n🎯 هدفك كان: {tr['target']:.2f}$\nبيع وخذ ربحك 👏")
+                            del active_trades[ticker]
+                        elif curr <= tr['stop']:
+                            send_to_me(f"❌ ضرب الوقف - <b>{ticker}</b>\n\nدخول: {tr['entry_price']:.2f}$ | الآن: {curr:.2f}$ | {pnl:+.1f}%\n🛑 وقفك كان: {tr['stop']:.2f}$\nاطلع لا تنتظر")
+                            del active_trades[ticker]
                     except:
                         pass
         except:
             pass
         time.sleep(60)
 
+# ============ الفحص الكامل ============
 def main_loop(manual=False):
-    global last_report, last_debug, last_time, is_scanning
+    global last_scan_report, last_debug_report, last_scan_time, is_scanning
     if is_scanning:
-        return "scanning now"
+        return "الفحص شغال الحين، انتظر"
     is_scanning = True
-    tickers = get_stocks()
-    found = []
-    deb = []
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futs = {ex.submit(check_stock, t): t for t in tickers}
-        for fut in as_completed(futs):
-            t = futs[fut]
-            try:
-                tr, msg = fut.result()
-                if tr:
-                    k = tr["k"]
-                    lim = {"strong": MAX_STRONG, "medium": MAX_MEDIUM, "bounce": MAX_BOUNCE}[k]
-                    if alerts[k] >= lim:
-                        continue
-                    if t in last_sent:
-                        dt = (datetime.now(SAUDI_TZ) - last_sent[t]).total_seconds()
-                        if dt < 3600:
-                            continue
-                    alerts[k] += 1
-                    last_sent[t] = datetime.now(SAUDI_TZ)
-                    active[t] = tr
-                    send_me(fmt(tr))
-                    found.append(tr)
-                else:
-                    deb.append(msg)
-            except Exception as e:
-                deb.append(f"{t}: {e}")
-    last_time = datetime.now(SAUDI_TZ)
-    last_report = f"Last: {last_time.strftime('%I:%M %p')} Found {len(found)} Checked {len(tickers)}"
-    last_debug = "\n".join(deb[:50])
-    is_scanning = False
-    return f"Done found {len(found)}"
+    # شلنا انتظار 30 دقيقة - يرسل من 5:30 على طول
 
+    tickers = get_all_us_stocks()
+    found = []
+    debug_lines = []
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(check_stock, t): t for t in tickers}
+        for fut in as_completed(futures):
+            ticker = futures[fut]
+            try:
+                trade, msg = fut.result()
+                if trade:
+                    kind = trade["kind"]
+                    limit = {"strong": MAX_ALERTS_STRONG, "medium": MAX_ALERTS_MEDIUM, "bounce": MAX_ALERTS_BOUNCE}[kind]
+                    if alerts_count[kind] >= limit:
+                        continue
+                    if ticker in last_sent:
+                        if (datetime.now(SAUDI_TZ) - last_sent[ticker]).total_seconds() < 3600:
+                            continue
+                    alerts_count[kind] += 1
+                    last_sent[ticker] = datetime.now(SAUDI_TZ)
+                    add_active(trade)
+                    send_to_me(format_message(trade))
+                    found.append(trade)
+                else:
+                    debug_lines.append(msg)
+            except Exception as e:
+                debug_lines.append(f"{ticker}: {e}")
+
+    last_scan_time = datetime.now(SAUDI_TZ)
+    last_scan_report = f"آخر فحص: {last_scan_time.strftime('%I:%M %p')} | وجد {len(found)} فرصة | فحص {len(tickers)} سهم"
+    last_debug_report = "\n".join(debug_lines[:50])
+    is_scanning = False
+    return f"تم الفحص، وجد {len(found)} فرصة"
+
+# ============ تصفير يومي ============
 def daily_reset():
-    global alerts, active
+    global alerts_count, active_trades
     while True:
         now = datetime.now(SAUDI_TZ)
         if now.hour == 0 and now.minute == 0:
-            alerts = {"strong": 0, "medium": 0, "bounce": 0}
-            active = {}
+            alerts_count = {"strong": 0, "medium": 0, "bounce": 0}
+            active_trades = {}
             last_sent.clear()
-            send_me("Reset done")
+            send_to_me("🔄 تم تصفير عداد اليوم، نبدأ يوم جديد")
             time.sleep(61)
         time.sleep(30)
 
-def handle(chat_id, text):
+# ============ أوامر التليجرام ============
+def handle_command(chat_id, text):
     if text == "/start":
-        send_tg(chat_id, "Bot ON. /help")
+        send_telegram(chat_id, "أهلاً بك! بوت الفرص شغال ✅\nاكتب /help لتشوف الأوامر")
     elif text == "/help":
-        send_tg(chat_id, "/scan /status /report /debug /active /id /help")
+        send_telegram(chat_id, "الأوامر:\n/scan - فحص الحين\n/status - حالة البوت وكم فرصة باقي\n/report - تقرير آخر فحص\n/debug - تشخيص ليش ما طلعت فرصة\n/active - الصفقات النشطة اليوم\n/id - رقمك\n/help - المساعدة")
     elif text == "/id":
-        send_tg(chat_id, f"ID: {chat_id}")
+        send_telegram(chat_id, f"رقمك: {chat_id}")
     elif text == "/scan":
-        send_tg(chat_id, "Scanning...")
-        send_tg(chat_id, main_loop(True))
+        send_telegram(chat_id, "جار الفحص...")
+        send_telegram(chat_id, main_loop(manual=True))
     elif text == "/status":
-        s = f"Last: {last_time}\nOpen: {market_open()}\nStrong {alerts['strong']}/{MAX_STRONG}\nMedium {alerts['medium']}/{MAX_MEDIUM}\nBounce {alerts['bounce']}/{MAX_BOUNCE}\nActive: {len(active)}"
-        send_tg(chat_id, s)
-    elif text == "/report":
-        send_tg(chat_id, last_report)
-    elif text == "/debug":
-        send_tg(chat_id, last_debug[:3000])
-    elif text == "/active":
-        if not active:
-            send_tg(chat_id, "No active")
-        else:
-            m = "Active:\n"
-            for t, tr in active.items():
-                try:
-                    cur = yf.Ticker(t).history(period="1d", interval="1m").iloc[-1]["Close"]
-                    pnl = (cur/tr["p"]-1)*100
-                    m += f"{t} {tr['p']:.2f} Now {cur:.2f} {pnl:+.1f}% TG {tr['tg']:.2f} ST {tr['st']:.2f}\n"
-                except:
-                    m += f"{t} {tr['p']:.2f} TG {tr['tg']:.2f} ST {tr['st']:.2f}\n"
-            send_tg(chat_id, m)
-    else:
-        send_tg(chat_id, "Use /help")
+        send_telegram(chat_id, f"""📊 حالة البوت:
+آخر فحص: {last_scan_time.strftime('%I:%M %p') if last_scan_time else 'لا يوجد'}
+السوق مفتوح: {'نعم' if is_market_open() else 'لا'}
 
-def polling():
-    off = 0
+فرص قوية اليوم: {alerts_count['strong']}/{MAX_ALERTS_STRONG}
+فرص متوسطة: {alerts_count['medium']}/{MAX_ALERTS_MEDIUM}
+فرص ارتداد: {alerts_count['bounce']}/{MAX_ALERTS_BOUNCE}
+
+باقي لك: {MAX_ALERTS_STRONG - alerts_count['strong']} قوية + {MAX_ALERTS_MEDIUM - alerts_count['medium']} متوسطة + {MAX_ALERTS_BOUNCE - alerts_count['bounce']} ارتداد = {9 - sum(alerts_count.values())} فرص
+صفقات نشطة: {len(active_trades)}
+""")
+    elif text == "/report":
+        send_telegram(chat_id, last_scan_report)
+    elif text == "/debug":
+        send_telegram(chat_id, f"تشخيص آخر فحص:\n{last_debug_report[:3000]}")
+    elif text == "/active":
+        if not active_trades:
+            send_telegram(chat_id, "لا يوجد صفقات نشطة اليوم")
+        else:
+            msg = "📈 الصفقات النشطة اليوم:\n\n"
+            for t, tr in active_trades.items():
+                try:
+                    curr = yf.Ticker(t).history(period="1d", interval="1m").iloc[-1]["Close"]
+                    pnl = ((curr / tr['entry_price'] - 1) * 100)
+                    msg += f"{t}: دخول {tr['entry_price']:.2f} | الآن {curr:.2f} | {pnl:+.1f}% | هدف {tr['target']:.2f} | وقف {tr['stop']:.2f}\n\n"
+                except:
+                    msg += f"{t}: دخول {tr['entry_price']:.2f} | هدف {tr['target']:.2f} | وقف {tr['stop']:.2f}\n\n"
+            send_telegram(chat_id, msg)
+    else:
+        send_telegram(chat_id, "ما فهمت، اكتب /help")
+
+def telegram_polling():
+    offset = 0
     while True:
         try:
-            u = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={off}&timeout=30"
-            r = requests.get(u, timeout=35).json()
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=30"
+            r = requests.get(url, timeout=35).json()
             for upd in r.get("result", []):
-                off = upd["update_id"] + 1
+                offset = upd["update_id"] + 1
                 if "message" in upd:
-                    handle(upd["message"]["chat"]["id"], upd["message"].get("text", ""))
+                    handle_command(upd["message"]["chat"]["id"], upd["message"].get("text", ""))
         except Exception as e:
-            print(e)
+            print(f"Polling Error: {e}")
             time.sleep(5)
 
+# ============ التشغيل ============
 if __name__ == "__main__":
     threading.Thread(target=daily_reset, daemon=True).start()
-    threading.Thread(target=polling, daemon=True).start()
-    threading.Thread(target=check_active, daemon=True).start()
-    send_me("Bot ON - 5-200$ - from 5:30")
+    threading.Thread(target=telegram_polling, daemon=True).start()
+    threading.Thread(target=check_active_trades, daemon=True).start()
+    send_to_me("✅ البوت اشتغل - السعر 5$-200$ - يرسل من 5:30 - مع تنبيه الهدف والوقف")
     while True:
-        if market_open():
+        if is_market_open():
             main_loop()
-        time.sleep(SCAN_MIN * 60)
+        time.sleep(SCAN_INTERVAL_MIN * 60)
