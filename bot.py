@@ -3,13 +3,20 @@ import time
 import requests
 import threading
 from datetime import datetime, timezone, timedelta
+from flask import Flask
+
+# منفذ وهمي عشان Render المجاني ما يطفي البوت
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "Bot is running"
 
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN", "")
-FINNHUB_API_KEY = os.getenv("MARKETDATA_TOKEN", "")
+FINNHUB_API_KEY = os.getenv("MARKETDATA_TOKEN", "") or os.getenv("FINNHUB_API_KEY", "") or os.getenv("FINNHUB_TOKEN", "")
 LAST_CHAT_ID = 0
 
 print("BOT_TOKEN found:", bool(TELEGRAM_TOKEN))
-print("MARKETDATA_TOKEN found:", bool(FINNHUB_API_KEY))
+print("FINNHUB found:", bool(FINNHUB_API_KEY))
 
 COMPANIES = [
     "AAPL","NVDA","AMD","INTC","MU","QCOM","CRM","UBER","ABNB","SHOP",
@@ -31,8 +38,6 @@ def send_to_me(text):
     global LAST_CHAT_ID
     if LAST_CHAT_ID:
         send_telegram(LAST_CHAT_ID, text)
-    else:
-        print("No chat yet, skip:", text)
 
 def get_quote(symbol):
     try:
@@ -56,15 +61,15 @@ def get_candle(symbol):
 
 def is_market_time():
     saudi = datetime.now(timezone(timedelta(hours=3)))
-    h = saudi.hour
+    if saudi.weekday() >= 5:
+        return False
+    h = saudi.hour + saudi.minute/60
     return 17 <= h < 24
 
 def scan_market():
     if not is_market_time():
-        return "⏰ السوق مغلق الان\nالفحص يشتغل من 5 المغرب الى 12 الليل بتوقيت السعودية"
-    
+        return "⏰ السوق مقفل الان\nالبوت يشتغل وقت التداول بس: من 5 المغرب لـ 12 الليل، الاثنين للجمعة"
     strong, medium, rebound = [], [], []
-    
     for sym in COMPANIES:
         q = get_quote(sym)
         price = q.get("c", 0)
@@ -73,9 +78,7 @@ def scan_market():
             continue
         if not (50 <= price <= 200):
             continue
-        
         change = (price - prev) / prev * 100
-        
         candle = get_candle(sym)
         vol_ratio = 1.0
         liquidity = 0
@@ -88,12 +91,9 @@ def scan_market():
             if vols:
                 liquidity = price * vols[-1]
             if lows:
-                # الدعم = اقل سعر في آخر 3 ايام
                 support = min(lows[-3:])
-        
         if liquidity < 10000000:
             continue
-        
         if change >= 3 and vol_ratio >= 1.5:
             target = round(price * 1.04, 2)
             stop = round(price * 0.97, 2)
@@ -103,13 +103,12 @@ def scan_market():
             stop = round(price * 0.98, 2)
             medium.append(f"⚡ {sym}\nالسعر: ${price}\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop}")
         elif support > 0:
-            dist_from_support = (price - support) / support * 100
-            if 0 <= dist_from_support <= 2 and change > 0.3 and vol_ratio >= 1.2:
+            dist = (price - support) / support * 100
+            if 0 <= dist <= 2 and change > 0.3 and vol_ratio >= 1.2:
                 target = round(price * 1.03, 2)
                 stop = round(support * 0.99, 2)
-                rebound.append(f"🔄 {sym}\nالسعر: ${price}\nالدعم: ${round(support,2)} | بعده عن الدعم: {round(dist_from_support,2)}%\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop} (تحت الدعم)")
+                rebound.append(f"🔄 {sym}\nالسعر: ${price}\nالدعم: ${round(support,2)} | بعده: {round(dist,2)}%\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop} (تحت الدعم)")
         time.sleep(0.3)
-    
     msg = "📊 فحص السوق الأمريكي (50$ - 200$):\n\n"
     if strong:
         msg += "🔥 فرص قوية:\n" + "\n\n".join(strong) + "\n\n"
@@ -136,7 +135,6 @@ def poll_telegram():
                 if chat:
                     if LAST_CHAT_ID != chat:
                         LAST_CHAT_ID = chat
-                        print("New chat saved:", chat)
                     if text == "/start":
                         send_telegram(chat, "✅ البوت شغال\nارسل /scan عشان تفحص السوق\nارسل /status عشان SPY و QQQ")
                     elif text == "/status":
@@ -167,5 +165,5 @@ if __name__ == "__main__":
     print("Bot started...")
     threading.Thread(target=poll_telegram, daemon=True).start()
     threading.Thread(target=alerts_loop, daemon=True).start()
-    while True:
-        time.sleep(60)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
