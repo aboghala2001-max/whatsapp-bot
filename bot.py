@@ -5,7 +5,6 @@ import threading
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 
-# منفذ وهمي عشان Render المجاني ما يطفي البوت
 app = Flask(__name__)
 @app.route('/')
 def home():
@@ -59,6 +58,18 @@ def get_candle(symbol):
     except:
         return {}
 
+def get_intraday(symbol):
+    # شموع 5 دقايق لليوم نفسه عشان الدعم اليومي
+    try:
+        now = int(time.time())
+        url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=5&from={now-86400}&to={now}&token={FINNHUB_API_KEY}"
+        r = requests.get(url, timeout=10).json()
+        if r.get("s") == "ok" and len(r.get("l", [])) >= 2:
+            return r
+        return {}
+    except:
+        return {}
+
 def is_market_time():
     saudi = datetime.now(timezone(timedelta(hours=3)))
     if saudi.weekday() >= 5:
@@ -68,7 +79,7 @@ def is_market_time():
 
 def scan_market():
     if not is_market_time():
-        return "⏰ السوق مقفل الان\nالبوت يشتغل وقت التداول بس: من 5 المغرب لـ 12 الليل، الاثنين للجمعة"
+        return None
     strong, medium, rebound = [], [], []
     for sym in COMPANIES:
         q = get_quote(sym)
@@ -82,33 +93,45 @@ def scan_market():
         candle = get_candle(sym)
         vol_ratio = 1.0
         liquidity = 0
-        support = 0
         if candle:
             vols = candle.get("v", [])
-            lows = candle.get("l", [])
             if len(vols) >= 2 and vols[-2] > 0:
                 vol_ratio = vols[-1] / vols[-2]
             if vols:
                 liquidity = price * vols[-1]
-            if lows:
-                support = min(lows[-3:])
         if liquidity < 10000000:
             continue
-        if change >= 3 and vol_ratio >= 1.5:
+        # القوية: حسب الحجم والسيولة بس
+        if vol_ratio >= 1.5 and change > 0:
             target = round(price * 1.04, 2)
             stop = round(price * 0.97, 2)
             strong.append(f"🔥 {sym}\nالسعر: ${price}\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop}")
-        elif change >= 1.5 and vol_ratio >= 1.2:
+        # المتوسطة: حسب الحجم والسيولة بس
+        elif vol_ratio >= 1.2 and change > 0:
             target = round(price * 1.025, 2)
             stop = round(price * 0.98, 2)
             medium.append(f"⚡ {sym}\nالسعر: ${price}\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop}")
-        elif support > 0:
-            dist = (price - support) / support * 100
-            if 0 <= dist <= 2 and change > 0.3 and vol_ratio >= 1.2:
-                target = round(price * 1.03, 2)
-                stop = round(support * 0.99, 2)
-                rebound.append(f"🔄 {sym}\nالسعر: ${price}\nالدعم: ${round(support,2)} | بعده: {round(dist,2)}%\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop} (تحت الدعم)")
+        else:
+            # الارتداد: دعم يومي - لمس الدعم مرتين اليوم نفسه
+            intra = get_intraday(sym)
+            support = 0
+            touches = 0
+            if intra:
+                lows = intra.get("l", [])
+                if lows:
+                    support = min(lows)
+                    if support > 0:
+                        # لمسة = قاع شمعة 5 دقايق قريب من الدعم بفرق 0.5% او اقل
+                        touches = sum(1 for l in lows if abs(l - support) / support <= 0.005)
+            if support > 0:
+                dist = (price - support) / support * 100
+                if touches >= 2 and 0 <= dist <= 2 and change > 0.3 and vol_ratio >= 1.2:
+                    target = round(price * 1.03, 2)
+                    stop = round(support * 0.99, 2)
+                    rebound.append(f"🔄 {sym}\nالسعر: ${price}\nالدعم اليومي: ${round(support,2)} | بعده: {round(dist,2)}% | لمسه: {touches} مرات اليوم\nالتغير: +{round(change,2)}% | الحجم: {round(vol_ratio,2)}x\n🎯 الهدف: ${target}\n🛑 الوقف: ${stop} (تحت الدعم)")
         time.sleep(0.3)
+    if not strong and not medium and not rebound:
+        return None
     msg = "📊 فحص السوق الأمريكي (50$ - 200$):\n\n"
     if strong:
         msg += "🔥 فرص قوية:\n" + "\n\n".join(strong) + "\n\n"
@@ -116,8 +139,6 @@ def scan_market():
         msg += "⚡ فرص متوسطة:\n" + "\n\n".join(medium) + "\n\n"
     if rebound:
         msg += "🔄 فرص ارتداد من الدعم:\n" + "\n\n".join(rebound) + "\n\n"
-    if not strong and not medium and not rebound:
-        msg += "لا توجد فرص قوية الان حسب الحجم والسيولة"
     return msg
 
 def poll_telegram():
@@ -143,7 +164,9 @@ def poll_telegram():
                         send_telegram(chat, f"📊 الأسعار:\nSPY: ${spy}\nQQQ: ${qqq}")
                     elif text == "/scan":
                         send_telegram(chat, "🔍 جاري فحص 40 شركة...")
-                        send_telegram(chat, scan_market())
+                        result = scan_market()
+                        if result:
+                            send_telegram(chat, result)
                     elif text == "/price":
                         spy = get_quote("SPY").get("c", 0)
                         qqq = get_quote("QQQ").get("c", 0)
@@ -157,7 +180,9 @@ def alerts_loop():
         time.sleep(600)
         if LAST_CHAT_ID and is_market_time():
             try:
-                send_to_me("⏰ فحص تلقائي:\n" + scan_market())
+                result = scan_market()
+                if result:
+                    send_to_me("⏰ فحص تلقائي:\n" + result)
             except Exception as e:
                 print(e)
 
